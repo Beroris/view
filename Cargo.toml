@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/view-core", "platforms/windows"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+view-core = { path = "crates/view-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Only the formats View decodes itself: animated GIF, WebP (still and animated) and APNG.
+# Everything else goes through the platform's own codecs.
+image = { version = "0.25", default-features = false, features = ["gif", "webp", "png"] }
+kamadak-exif = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+# A panic on a decode worker is caught and shown as a failed image; it must not take the window down.
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1
+
+# Decoders and pixel loops are far too slow unoptimised; keep dependencies fast in dev.
+[profile.dev.package."*"]
+opt-level = 3

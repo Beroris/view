@@ -1,0 +1,20 @@
+[package]
+name = "view-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "View's platform-neutral engine: folders, sorting, zoom and pan, caching, metadata and the built-in decoders. No OS calls."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+kamadak-exif.workspace = true
+# Inflating 3MF packages. Already part of the build through the PNG decoder.
+miniz_oxide = "0.8"
+
+[dev-dependencies]
+# Only for examples/fixtures.rs, which writes test images. None of this reaches View itself.
+image = { version = "0.25", default-features = false, features = ["gif", "webp", "png", "jpeg", "bmp", "tiff", "ico"] }
+png = "0.18"
+image-webp = "0.2"
