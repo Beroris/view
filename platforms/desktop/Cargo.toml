@@ -1,0 +1,21 @@
+[package]
+name = "view-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "View for Linux and macOS: a lean photo viewer on the same engine, drawn on the CPU. No GPU, toolkit or system codecs needed."
+
+# Not `view`: on Linux that name already belongs to vim.
+[[bin]]
+name = "bero-view"
+path = "src/main.rs"
+
+[dependencies]
+view-core.workspace = true
+winit = "0.30"
+softbuffer = "0.4"
+ab_glyph = "0.2"
+# Linux and macOS have no codecs View can count on, so every format is decoded here.
+image = { version = "0.25", default-features = false, features = ["gif", "webp", "png", "jpeg", "bmp", "tiff", "ico"] }
+trash = "5"
+arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }

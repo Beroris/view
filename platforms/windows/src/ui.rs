@@ -25,6 +25,44 @@ pub use screens::{GridLayout, grid_layout};
 const FADE: Duration = Duration::from_millis(160);
 /// How long the volume slider takes to slide out.
 const SLIDE: Duration = Duration::from_millis(180);
+/// A button's fill coming up under the mouse, and going again.
+const GLOW_IN: Duration = Duration::from_millis(110);
+const GLOW_OUT: Duration = Duration::from_millis(200);
+/// A button turning on or off.
+const SWITCH: Duration = Duration::from_millis(260);
+/// The photo and the grid giving way to each other.
+pub const SCREEN_SWITCH: Duration = Duration::from_millis(240);
+
+/// One button's fill and its "on" ring, each easing towards where it's going.
+struct Glow {
+    hit: Hit,
+    /// How strong the fill is, in hover steps: from, to, since when.
+    fill: (f32, f32, Instant),
+    /// How far on it is, 0 to 1: from, to, since when.
+    on: (f32, f32, Instant),
+}
+
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+impl Glow {
+    fn fill_now(&self) -> f32 {
+        let (from, to, at) = self.fill;
+        let d = if to > from { GLOW_IN } else { GLOW_OUT };
+        from + (to - from) * ease_out(at.elapsed().as_secs_f32() / d.as_secs_f32())
+    }
+    fn on_now(&self) -> f32 {
+        let (from, to, at) = self.on;
+        // Turning on overshoots a little, so it lands with a small bounce.
+        let t = (at.elapsed().as_secs_f32() / SWITCH.as_secs_f32()).clamp(0.0, 1.0);
+        let e = if to > from { 1.0 + 2.2 * (t - 1.0).powi(3) + 1.2 * (t - 1.0).powi(2) } else { ease_out(t) };
+        from + (to - from) * e
+    }
+    fn moving(&self) -> bool {
+        self.fill.2.elapsed() < GLOW_OUT || self.on.2.elapsed() < SWITCH
+    }
+}
 /// The strip at the top that works as the title bar, in DIPs.
 pub const TITLE: f32 = 40.0;
 /// Window buttons, in DIPs: Windows' own width.
@@ -68,6 +106,12 @@ pub enum Hit {
     Strip,
     /// One of the editor's sliders.
     Slider(u8),
+    /// The name at the top: a click shows or hides the information card, a drag moves the
+    /// window.
+    Title,
+    /// The trimmed video's start (0) and end (1) handles, the bar between (2), and its splits
+    /// (3 and on).
+    Trim(u8),
 }
 
 pub struct State {
@@ -94,7 +138,20 @@ pub struct State {
     volume_from: f32,
     volume_at: Instant,
     /// The seek bar's track, for turning a click into a time.
-    seek_track: Option<D2D_RECT_F>,
+    pub seek_track: Option<D2D_RECT_F>,
+    /// The speeds, over the speed button: out or not, and how far out (0 to 1) since when.
+    speeds_out: bool,
+    speeds_from: f32,
+    speeds_at: Instant,
+    /// The filmstrip comes up as the mouse nears the bottom: out or not, and how far (0 to 1)
+    /// since when.
+    strip_out: bool,
+    strip_from: f32,
+    strip_at: Instant,
+    /// The mark on the chosen speed slides to it: the row it left, the row it's going to, and
+    /// since when.
+    speed_mark: (f32, f32),
+    speed_mark_at: Instant,
     /// A dialog is up: only its controls answer the mouse.
     modal: bool,
     /// Interface text that can be selected, and what is.
@@ -107,6 +164,9 @@ pub struct State {
     /// Where the photo being edited is on screen, and the editor's slider tracks.
     pub edit_frame: Option<D2D_RECT_F>,
     sliders: [Option<D2D_RECT_F>; 5],
+    /// Each button's fill and ring, eased. Kept across screens, so the grid button's ring grows
+    /// as the grid comes in.
+    glows: std::cell::RefCell<Vec<Glow>>,
 }
 
 impl State {
@@ -129,6 +189,14 @@ impl State {
             panel_scroll: 0.0,
             panel_content: 0.0,
             seek_track: None,
+            speeds_out: false,
+            speeds_from: 0.0,
+            speeds_at: long_ago,
+            strip_out: false,
+            strip_from: 0.0,
+            strip_at: long_ago,
+            speed_mark: (0.0, 0.0),
+            speed_mark_at: long_ago,
             volume_track: None,
             volume_out: false,
             volume_from: 0.0,
@@ -139,7 +207,30 @@ impl State {
             solid: false,
             edit_frame: None,
             sliders: [None; 5],
+            glows: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// A button's fill and on-ness this frame, easing towards `fill` and `on`.
+    fn glow(&self, hit: Hit, fill: f32, on: f32) -> (f32, f32) {
+        let mut glows = self.glows.borrow_mut();
+        let now = Instant::now();
+        let i = match glows.iter().position(|g| g.hit == hit) {
+            Some(i) => i,
+            None => {
+                let long_ago = now - SWITCH;
+                glows.push(Glow { hit, fill: (0.0, 0.0, long_ago), on: (on, on, long_ago) });
+                glows.len() - 1
+            }
+        };
+        let g = &mut glows[i];
+        if g.fill.1 != fill {
+            g.fill = (g.fill_now(), fill, now);
+        }
+        if g.on.1 != on {
+            g.on = (g.on_now(), on, now);
+        }
+        (g.fill_now(), g.on_now())
     }
 
     /// Show or hide the toolbar and arrows, fading.
@@ -158,7 +249,69 @@ impl State {
     }
 
     pub fn fading(&self) -> bool {
-        self.fade_at.elapsed() < FADE || self.volume_at.elapsed() < SLIDE
+        self.fade_at.elapsed() < FADE
+            || self.volume_at.elapsed() < SLIDE
+            || self.speeds_at.elapsed() < SLIDE
+            || self.speed_mark_at.elapsed() < SLIDE
+            || self.strip_at.elapsed() < SLIDE
+            || self.glows.borrow().iter().any(Glow::moving)
+    }
+
+    /// Bring the filmstrip up, or let it go.
+    pub fn slide_strip(&mut self, out: bool) {
+        if out != self.strip_out {
+            self.strip_from = self.strip_open();
+            self.strip_out = out;
+            self.strip_at = Instant::now();
+        }
+    }
+
+    /// How far up the filmstrip is, from 0 to 1, eased.
+    pub fn strip_open(&self) -> f32 {
+        let t = (self.strip_at.elapsed().as_secs_f32() / SLIDE.as_secs_f32()).min(1.0);
+        let t = 1.0 - (1.0 - t).powi(3);
+        let to = if self.strip_out { 1.0 } else { 0.0 };
+        self.strip_from + (to - self.strip_from) * t
+    }
+
+    /// Whether the speeds are out over the speed button.
+    pub fn speeds_out(&self) -> bool {
+        self.speeds_out
+    }
+
+    /// Bring the speeds out, with the mark on row `chosen`, or put them away.
+    pub fn show_speeds(&mut self, out: bool, chosen: usize) {
+        if out != self.speeds_out {
+            self.speeds_from = self.speeds_open();
+            self.speeds_out = out;
+            self.speeds_at = Instant::now();
+            if out {
+                self.speed_mark = (chosen as f32, chosen as f32);
+            }
+        }
+    }
+
+    /// Slide the mark to row `chosen`, from wherever it is.
+    pub fn mark_speed(&mut self, chosen: usize) {
+        if self.speed_mark.1 != chosen as f32 {
+            self.speed_mark = (self.speed_mark_row(), chosen as f32);
+            self.speed_mark_at = Instant::now();
+        }
+    }
+
+    /// How far out the speeds are, from 0 to 1, eased.
+    fn speeds_open(&self) -> f32 {
+        let t = (self.speeds_at.elapsed().as_secs_f32() / SLIDE.as_secs_f32()).min(1.0);
+        let t = 1.0 - (1.0 - t).powi(3);
+        let to = if self.speeds_out { 1.0 } else { 0.0 };
+        self.speeds_from + (to - self.speeds_from) * t
+    }
+
+    /// The row the mark is over right now, part-way between two while it slides.
+    fn speed_mark_row(&self) -> f32 {
+        let t = (self.speed_mark_at.elapsed().as_secs_f32() / SLIDE.as_secs_f32()).min(1.0);
+        let t = 1.0 - (1.0 - t).powi(3);
+        self.speed_mark.0 + (self.speed_mark.1 - self.speed_mark.0) * t
     }
 
     /// Slide the volume slider out or back in.
@@ -210,7 +363,7 @@ impl State {
             Hit::Minimize => Some(Cmd::Minimize),
             Hit::Maximize => Some(Cmd::Maximize),
             Hit::CloseWindow => Some(Cmd::Close),
-            Hit::Panel | Hit::Toolbar | Hit::Seek | Hit::Volume | Hit::DialogButton(_) | Hit::DialogCheck | Hit::Modal | Hit::Field | Hit::Thumb(_) | Hit::Strip | Hit::Slider(_) => None,
+            Hit::Panel | Hit::Toolbar | Hit::Seek | Hit::Volume | Hit::DialogButton(_) | Hit::DialogCheck | Hit::Modal | Hit::Field | Hit::Thumb(_) | Hit::Strip | Hit::Slider(_) | Hit::Title | Hit::Trim(_) => None,
         }
     }
 
@@ -253,6 +406,9 @@ impl State {
     }
 }
 
+/// The room kept under the video for the trimming controls, in DIPs.
+pub const TRIM_ROOM: f32 = 186.0;
+
 struct Ctx<'a> {
     text: &'a Text,
     s: f32,
@@ -283,7 +439,10 @@ pub fn draw(app: &mut App, gpu: &mut Gpu) {
     let scale = app.scale();
     app.ui.targets.clear();
     app.ui.pick.begin();
-    let alpha = if app.ui.hidden { 0.0 } else { app.ui.alpha() };
+    // Trimming, the controls stay up.
+    let trimming = app.trim.is_some();
+    app.ui.solid = trimming;
+    let alpha = if trimming { 1.0 } else if app.ui.hidden { 0.0 } else { app.ui.alpha() };
     let empty = app.shown.as_ref().is_none_or(|s| s.picture.is_none());
 
     // Glass needs the picture drawn somewhere it can be read back and blurred.
@@ -321,6 +480,7 @@ pub fn draw(app: &mut App, gpu: &mut Gpu) {
         shades(gpu, &p, cw, ch, scale, alpha, app.folder.current().is_some(), true);
     }
     gpu.unclip();
+    screen_switch(app, gpu, cw, ch);
     if scene {
         gpu.end_scene();
     }
@@ -347,11 +507,15 @@ pub fn draw(app: &mut App, gpu: &mut Gpu) {
         app.ui.panel = None;
     }
 
-    if alpha > 0.01 {
+    if trimming {
+        let mid = scale * TITLE / 2.0;
+        title(app, gpu, aw, mid, 1.0);
+        screens::trim_bar(app, gpu, aw, ch);
+    } else if alpha > 0.01 {
         let mid = scale * TITLE / 2.0;
         title(app, gpu, aw, mid, alpha);
-        toolbar(app, gpu, aw, ah, alpha);
         screens::filmstrip(app, gpu, aw, ah, alpha);
+        toolbar(app, gpu, aw, ah, alpha);
         arrows(app, gpu, aw, ah, alpha);
     }
     caption_buttons(app, gpu, cw, alpha);
@@ -493,11 +657,40 @@ fn draw_peek(app: &mut App, gpu: &mut Gpu) {
     label(&cx, gpu, text, open, 12.5, 600, Align::Center, p.accent.ink(), alpha);
     app.ui.targets.push((open, hit));
 
+    // A file with two views: laid out to read, or the text it's written in. Two halves of one
+    // pill, the one showing filled in.
+    let mut left_edge = open.left;
+    if let Some(as_text) = app.peek.as_ref().and_then(|k| k.doc.as_ref()).and_then(|d| d.shows_text()) {
+        let halves = [("Visual", false), ("Text", true)];
+        let widths: Vec<f32> = halves.iter().map(|(t, _)| (measure(&cx, t, 12.5, 600) + cx.px(24.0)).round()).collect();
+        let w: f32 = widths.iter().sum();
+        let pill = rect(open.left - cx.px(8.0) - w, m, w, d);
+        glass_box(gpu, &p, pill, d / 2.0, s, alpha);
+        let cx = Ctx { text: &app.text, s };
+        let mut x = pill.left;
+        for ((text, is_text), hw) in halves.iter().zip(&widths) {
+            let half = rect(x, m, *hw, d);
+            let hit = Hit::Button(Cmd::ShowText(*is_text));
+            let inset = cx.px(3.0);
+            let inner = rect(half.left + inset, half.top + inset, hw - inset * 2.0, d - inset * 2.0);
+            if *is_text == as_text {
+                gpu.fill_round(inner, (d - inset * 2.0) / 2.0, p.text.d2d(0.16 * alpha));
+            } else if app.ui.hover == Some(hit) || app.ui.pressed == Some(hit) {
+                gpu.fill_round(inner, (d - inset * 2.0) / 2.0, p.hover.d2d(p.hover_alpha * 1.4 * alpha));
+            }
+            label(&cx, gpu, text, half, 12.5, 600, Align::Center, if *is_text == as_text { p.text } else { p.dim }, alpha);
+            app.ui.targets.push((half, hit));
+            x += hw;
+        }
+        left_edge = pill.left;
+    }
+    let cx = Ctx { text: &app.text, s };
+
     // With text selected: copy it. Ctrl+C does the same.
     if app.peek.as_ref().and_then(|k| k.doc.as_ref()).is_some_and(|d| d.has_selection()) || app.ui.pick.has_selection() {
         let text = "Copy";
         let w = (measure(&cx, text, 12.5, 600) + cx.px(28.0)).round();
-        let copy = rect(open.left - cx.px(8.0) - w, m, w, d);
+        let copy = rect(left_edge - cx.px(8.0) - w, m, w, d);
         let hit = Hit::Button(Cmd::CopyText);
         glass_box(gpu, &p, copy, d / 2.0, s, alpha);
         let cx = Ctx { text: &app.text, s };
@@ -979,6 +1172,7 @@ fn title(app: &mut App, gpu: &mut Gpu, aw: f32, mid: f32, alpha: f32) {
         Some(page) => page,
         None if app.grid.is_some() => if n == 1 { "1 file".into() } else { format!("{n} files") },
         None if app.editor.is_some() => "Editing".into(),
+        None if app.trim.is_some() => "Trimming".into(),
         None if n > 1 => format!("{} of {}", app.folder.index + 1, n),
         None => String::new(),
     };
@@ -991,14 +1185,21 @@ fn title(app: &mut App, gpu: &mut Gpu, aw: f32, mid: f32, alpha: f32) {
     let ph = cx.px(PILL);
     let top = (mid - ph / 2.0).round();
     let pad = cx.px(14.0);
-    glass_box(gpu, &p, rect(x - pad, top, nw + cw + pad * 2.0, ph), ph / 2.0, s, alpha);
+    let pill = rect(x - pad, top, nw + cw + pad * 2.0, ph);
+    glass_box(gpu, &p, pill, ph / 2.0, s, alpha);
+    // In the main window it shows or hides the information card. It lights up under the mouse,
+    // but looks the same whether the card is out or not.
+    if app.peek.is_none() && app.grid.is_none() && app.editor.is_none() && app.trim.is_none() {
+        hover_fill(gpu, &app.ui, &p, pill, Hit::Title, ph / 2.0, alpha, false);
+        app.ui.targets.push((pill, Hit::Title));
+    }
     label(&cx, gpu, entry, rect(x, top, nw + cx.px(2.0), ph), 13.0, 600, Align::Left, p.text, alpha);
     if !counter.is_empty() {
         let cr = rect(x + nw + gap, top, cw, ph);
         // A PDF's "Page 3 of 12" goes to another page when clicked, like Ctrl+G.
         let hit = Hit::Button(Cmd::GoToPage);
         let hovered = is_page && (app.ui.hover == Some(hit) || app.ui.pressed == Some(hit));
-        label(&cx, gpu, &counter, cr, 12.0, 500, Align::Left, if hovered { p.text } else { p.dim }, alpha);
+        label(&cx, gpu, &counter, cr, 12.0, 500, Align::Left, if hovered { p.text } else { p.soft() }, alpha);
         if is_page {
             app.ui.targets.push((rect(cr.left - gap / 2.0, top, cw, ph), hit));
         }
@@ -1178,7 +1379,12 @@ fn media_bar(app: &mut App, gpu: &mut Gpu, bar: D2D_RECT_F, alpha: f32, trailing
     let gap = cx.px(11.0);
     let trailing_items: Vec<Option<(Cmd, char)>> = if trailing {
         let fullscreen = app.is_fullscreen();
-        vec![None, Some((Cmd::Grid, '\u{E80A}')), Some((Cmd::Info, '\u{E946}')), Some((Cmd::Delete, '\u{E74D}')), None, Some((Cmd::Fullscreen, if fullscreen { '\u{E73F}' } else { '\u{E740}' })), Some((Cmd::Menu, '\u{E712}'))]
+        let mut items = vec![None, Some((Cmd::Grid, '\u{E80A}')), Some((Cmd::Info, '\u{E946}')), Some((Cmd::Delete, '\u{E74D}')), None, Some((Cmd::Fullscreen, if fullscreen { '\u{E73F}' } else { '\u{E740}' })), Some((Cmd::Menu, '\u{E712}'))];
+        // Videos can be trimmed: songs can't.
+        if app.player().is_some_and(|pl| pl.has_video()) {
+            items.insert(1, Some((Cmd::Edit, '\u{E8C6}')));
+        }
+        items
     } else {
         Vec::new()
     };
@@ -1238,6 +1444,7 @@ fn media_bar(app: &mut App, gpu: &mut Gpu, bar: D2D_RECT_F, alpha: f32, trailing
     }
 
     let mut x = tools;
+    let mut speed_button = None;
     for (cmd, glyph) in tail {
         let r = rect(x, y, button, button);
         let hit = Hit::Button(cmd);
@@ -1249,9 +1456,10 @@ fn media_bar(app: &mut App, gpu: &mut Gpu, bar: D2D_RECT_F, alpha: f32, trailing
     if speed_w > 0.0 {
         let r = rect(x, y, speed_w, button);
         let hit = Hit::Button(Cmd::SpeedMenu);
-        hover_fill(gpu, &app.ui, &p, r, hit, button / 2.0, alpha, false);
+        hover_fill(gpu, &app.ui, &p, r, hit, button / 2.0, alpha, app.ui.speeds_out());
         label(&cx, gpu, &speed, r, 12.0, 600, Align::Center, if app.speed == 1.0 { p.text } else { p.accent }, alpha);
         app.ui.targets.push((r, hit));
+        speed_button = Some(r);
         x += speed_w;
     }
     for item in trailing_items {
@@ -1270,6 +1478,56 @@ fn media_bar(app: &mut App, gpu: &mut Gpu, bar: D2D_RECT_F, alpha: f32, trailing
                 gpu.fill(rect(mx.round(), y + cx.px(10.0), 1.0, button - cx.px(20.0)), p.edge.d2d(p.edge_alpha * 1.6 * alpha));
                 x += gap;
             }
+        }
+    }
+    if let Some(r) = speed_button {
+        speeds(app, gpu, r, bar.top, alpha);
+    }
+}
+
+/// The speeds to pick from, rising out of the speed button. The mark slides to the one chosen.
+fn speeds(app: &mut App, gpu: &mut Gpu, button: D2D_RECT_F, bar_top: f32, alpha: f32) {
+    use crate::cmd::{SPEEDS, speed_label};
+    // Faded away with the rest of the controls, they're put away too.
+    if alpha < 0.3 {
+        let chosen = SPEEDS.iter().position(|&r| (r - app.speed).abs() < 1e-6).unwrap_or(3);
+        app.ui.show_speeds(false, chosen);
+    }
+    let open = app.ui.speeds_open();
+    if open < 0.01 {
+        return;
+    }
+    let s = app.scale();
+    let p = app.palette;
+    let cx = Ctx { text: &app.text, s };
+    let (row, pad, w) = (cx.px(30.0), cx.px(5.0), cx.px(84.0));
+    let h = row * SPEEDS.len() as f32 + pad * 2.0;
+    let a = alpha * open;
+    // It rises the last few pixels into place as it comes in.
+    let left = ((button.left + button.right) / 2.0 - w / 2.0).round();
+    let top = (bar_top - cx.px(8.0) - h + (1.0 - open) * cx.px(10.0)).round();
+    let panel = rect(left, top, w, h);
+    glass_box(gpu, &p, panel, cx.px(14.0), s, a);
+    let cx = Ctx { text: &app.text, s };
+    if app.ui.speeds_out() {
+        app.ui.targets.push((panel, Hit::Toolbar));
+    }
+    let mark = app.ui.speed_mark_row();
+    let mark_box = rect(left + pad, top + pad + mark * row, w - pad * 2.0, row);
+    gpu.fill_round(mark_box, cx.px(9.0), p.accent.d2d(a));
+    for (i, &rate) in SPEEDS.iter().enumerate() {
+        let r = rect(left + pad, top + pad + i as f32 * row, w - pad * 2.0, row);
+        let hit = Hit::Button(Cmd::Speed(i as u8));
+        // How much of this row the mark covers decides its ink, so the label changes colour as
+        // the mark passes over it.
+        let under = (1.0 - (mark - i as f32).abs()).clamp(0.0, 1.0);
+        if under < 0.5 {
+            hover_fill(gpu, &app.ui, &p, r, hit, cx.px(9.0), a, false);
+        }
+        let text = if rate == 1.0 { "Normal".to_string() } else { speed_label(rate) };
+        label(&cx, gpu, &text, r, 12.5, if under >= 0.5 { 600 } else { 500 }, Align::Center, if under >= 0.5 { p.accent.ink() } else { p.text }, a);
+        if app.ui.speeds_out() {
+            app.ui.targets.push((r, hit));
         }
     }
 }
@@ -1374,13 +1632,39 @@ fn toolbar(app: &mut App, gpu: &mut Gpu, aw: f32, ah: f32, alpha: f32) {
 fn hover_fill(gpu: &Gpu, ui: &State, p: &Palette, r: D2D_RECT_F, hit: Hit, radius: f32, alpha: f32, active: bool) {
     let pressed = ui.pressed == Some(hit);
     let hovered = ui.hover == Some(hit);
-    let a = if pressed { p.hover_alpha * 2.0 } else if hovered { p.hover_alpha * 1.4 } else if active { p.hover_alpha * 1.2 } else { 0.0 };
-    if a > 0.0 {
-        gpu.fill_round(r, radius, p.hover.d2d(a * alpha));
+    // A button that's on stays filled in, clearly more than a hover, with a hairline round it.
+    let want = if pressed { 2.6 } else if active && hovered { 2.4 } else if active { 2.0 } else if hovered { 1.4 } else { 0.0 };
+    let (fill, on) = ui.glow(hit, want, if active { 1.0 } else { 0.0 });
+    // The fill swells out from the middle as it comes up, and pulls in a touch while pressed.
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let grow = (fill / 1.4).min(1.0);
+    let squeeze = if pressed { 0.06 } else { 0.0 };
+    let inset = |k: f32| rect(r.left + w * k, r.top + h * k, w * (1.0 - 2.0 * k), h * (1.0 - 2.0 * k));
+    if fill > 0.005 {
+        let k = (1.0 - grow) * 0.14 + squeeze;
+        gpu.fill_round(inset(k), (radius * (1.0 - 2.0 * k)).max(0.0), p.hover.d2d(p.hover_alpha * fill * alpha));
     }
-    if active {
-        let dot = 2.0_f32.max(r.right - r.left) / 18.0;
-        gpu.fill_circle((r.left + r.right) / 2.0, r.bottom - dot * 1.6, dot, p.accent.d2d(alpha));
+    if on > 0.005 {
+        // The ring grows into place as it turns on, and shrinks away as it turns off.
+        let k = (1.0 - on.min(1.0)) * 0.2 - (on - 1.0).max(0.0) * 0.12;
+        gpu.stroke_round(inset(k), (radius * (1.0 - 2.0 * k)).max(0.0), 1.0, p.hover.d2d(p.hover_alpha * 2.2 * on.min(1.0) * alpha));
+    }
+}
+
+/// Just after going between the photo and the grid: what was there gives way to what's come,
+/// growing and fading as it goes. Drawn into the scene, so the glass bars blur it too.
+fn screen_switch(app: &App, gpu: &Gpu, cw: f32, ch: f32) {
+    let Some((at, into_grid)) = app.screen_switch else { return };
+    let t = at.elapsed().as_secs_f32() / SCREEN_SWITCH.as_secs_f32();
+    if t >= 1.0 {
+        return;
+    }
+    let e = ease_out(t);
+    // Into the grid the photo shrinks back into it; out of it, the grid swells past you.
+    let scale = if into_grid { 1.0 - 0.06 * e } else { 1.0 + 0.08 * e };
+    if !gpu.draw_kept(1.0 - e, scale) {
+        // Nothing kept from before: what's come fades up from the background instead.
+        gpu.fill(rect(0.0, 0.0, cw, ch), app.palette.backdrop.d2d(1.0 - e));
     }
 }
 
@@ -1400,7 +1684,10 @@ fn arrows(app: &mut App, gpu: &mut Gpu, aw: f32, ah: f32, alpha: f32) {
     let right = app.ui.panel.map_or(aw, |r| r.left);
     for (hit, x, glyph) in [(Hit::NavPrev, (18.0 * s).round(), '\u{E76B}'), (Hit::NavNext, right - (18.0 * s).round() - d, '\u{E76C}')] {
         let dist = if hit == Hit::NavPrev { mx } else { right - mx };
-        let near = if inside { (1.0 - (dist - zone) / ramp).clamp(0.0, 1.0) } else { 0.0 };
+        let my = app.mouse.1 as f32;
+        let on_other = app.ui.hover.is_some_and(|h| !matches!(h, Hit::NavPrev | Hit::NavNext));
+        let in_bars = my < TITLE * s || my > ah - 150.0 * s;
+        let near = if inside && !on_other && !in_bars { (1.0 - (dist - zone) / ramp).clamp(0.0, 1.0) } else { 0.0 };
         let hovered = app.ui.hover == Some(hit);
         let a = alpha * if hovered { 1.0 } else { near };
         if a < 0.02 {
@@ -1644,11 +1931,11 @@ fn info_panel(app: &mut App, gpu: &mut Gpu, cw: f32, ch: f32) {
                 y += cx.px(8.0);
                 gpu.fill(rect(r.left + pad, y.round(), width, 1.0), p.edge.d2d(p.edge_alpha * 1.6));
                 y += cx.px(14.0);
-                label(&cx, gpu, &t.to_uppercase(), rect(r.left + pad, y, width, cx.px(18.0)), 11.0, 600, Align::Left, p.dim, 1.0);
+                label(&cx, gpu, &t.to_uppercase(), rect(r.left + pad, y, width, cx.px(18.0)), 11.0, 600, Align::Left, p.soft(), 1.0);
                 y += cx.px(22.0);
             }
             Row::Fact(l, v) => {
-                let lh = paragraph_sel(&cx, gpu, &mut app.ui.pick, &p, l, r.left + pad, y, label_w - cx.px(8.0), 12.5, 400, Align::Left, p.dim, Some(view), Join::Line);
+                let lh = paragraph_sel(&cx, gpu, &mut app.ui.pick, &p, l, r.left + pad, y, label_w - cx.px(8.0), 12.5, 400, Align::Left, p.soft(), Some(view), Join::Line);
                 let vh = paragraph_sel(&cx, gpu, &mut app.ui.pick, &p, v, r.left + pad + label_w, y, width - label_w, 12.5, 400, Align::Left, p.text, Some(view), Join::Tab);
                 y += lh.max(vh) + cx.px(8.0);
             }

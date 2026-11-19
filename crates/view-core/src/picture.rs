@@ -35,18 +35,27 @@ impl Bitmap {
 
 /// From straight RGBA to premultiplied BGRA, in place.
 pub fn rgba_to_pbgra(data: &mut [u8]) {
+    // No branches and 16-bit sums, so the compiler does many pixels at a time. An opaque pixel
+    // comes out as it went in: multiplying by 255 and dividing by 255 this way is exact.
     for p in data.chunks_exact_mut(4) {
-        let a = p[3] as u32;
-        let (r, g, b) = (p[0] as u32, p[1] as u32, p[2] as u32);
-        if a == 255 {
-            p[0] = b as u8;
-            p[2] = r as u8;
-        } else {
-            p[0] = mul_div_255(b, a);
-            p[1] = mul_div_255(g, a);
-            p[2] = mul_div_255(r, a);
-        }
+        let a = p[3] as u16;
+        let (r, g, b) = (mul_div_255(p[0], a), mul_div_255(p[1], a), mul_div_255(p[2], a));
+        p[0] = b;
+        p[1] = g;
+        p[2] = r;
     }
+}
+
+/// Straight RGB, three bytes a pixel, to opaque BGRA.
+pub fn rgb_to_bgra(rgb: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; rgb.len() / 3 * 4];
+    for (d, s) in out.chunks_exact_mut(4).zip(rgb.chunks_exact(3)) {
+        d[0] = s[2];
+        d[1] = s[1];
+        d[2] = s[0];
+        d[3] = 255;
+    }
+    out
 }
 
 /// From premultiplied BGRA back to straight RGBA, in place.
@@ -65,8 +74,9 @@ pub fn pbgra_to_rgba(data: &mut [u8]) {
     }
 }
 
-fn mul_div_255(v: u32, a: u32) -> u8 {
-    let t = v * a + 128;
+#[inline(always)]
+fn mul_div_255(v: u8, a: u16) -> u8 {
+    let t = v as u16 * a + 128;
     ((t + (t >> 8)) >> 8) as u8
 }
 
@@ -79,34 +89,57 @@ pub fn downscale(src: &Bitmap, width: u32, height: u32) -> Option<Bitmap> {
     }
     let mut out = Bitmap::try_new(width, height)?;
     let (sx, sy) = (src.width as f64 / width as f64, src.height as f64 / height as f64);
-    let mut acc = vec![0u64; width as usize * 4];
+    // Which source columns fall in each target column: worked out once, not for every row.
+    let spans: Vec<(usize, usize)> = (0..width)
+        .map(|tx| {
+            let x0 = (tx as f64 * sx) as u32;
+            let x1 = (((tx + 1) as f64 * sx).ceil() as u32).clamp(x0 + 1, src.width);
+            (x0 as usize, x1 as usize)
+        })
+        .collect();
+    let stride = src.width as usize * 4;
+    // A whole number of source pixels to each target pixel, the same for all: the common case
+    // (halving, quartering), and one the compiler can do many pixels of at a time.
+    let even = spans.iter().all(|&(x0, x1)| x1 - x0 == spans[0].1 - spans[0].0) && spans.windows(2).all(|w| w[0].1 == w[1].0);
+    let mut acc = vec![0u32; width as usize * 4];
     for ty in 0..height {
         let y0 = (ty as f64 * sy) as u32;
         let y1 = (((ty + 1) as f64 * sy).ceil() as u32).clamp(y0 + 1, src.height);
-        acc.iter_mut().for_each(|a| *a = 0);
-        let mut counts = vec![0u64; width as usize];
+        acc.fill(0);
         for y in y0..y1 {
-            let row = &src.data[(y * src.width * 4) as usize..((y + 1) * src.width * 4) as usize];
-            for tx in 0..width {
-                let x0 = (tx as f64 * sx) as u32;
-                let x1 = (((tx + 1) as f64 * sx).ceil() as u32).clamp(x0 + 1, src.width);
-                let a = &mut acc[tx as usize * 4..tx as usize * 4 + 4];
-                for x in x0..x1 {
-                    let p = &row[x as usize * 4..x as usize * 4 + 4];
-                    a[0] += p[0] as u64;
-                    a[1] += p[1] as u64;
-                    a[2] += p[2] as u64;
-                    a[3] += p[3] as u64;
+            let row = &src.data[y as usize * stride..(y as usize + 1) * stride];
+            if even {
+                let n = spans[0].1 - spans[0].0;
+                for (a, block) in acc.chunks_exact_mut(4).zip(row.chunks_exact(n * 4)) {
+                    for p in block.chunks_exact(4) {
+                        a[0] += p[0] as u32;
+                        a[1] += p[1] as u32;
+                        a[2] += p[2] as u32;
+                        a[3] += p[3] as u32;
+                    }
                 }
-                counts[tx as usize] += (x1 - x0) as u64;
+            } else {
+                for (a, &(x0, x1)) in acc.chunks_exact_mut(4).zip(&spans) {
+                    for p in row[x0 * 4..x1 * 4].chunks_exact(4) {
+                        a[0] += p[0] as u32;
+                        a[1] += p[1] as u32;
+                        a[2] += p[2] as u32;
+                        a[3] += p[3] as u32;
+                    }
+                }
             }
         }
-        let dst = &mut out.data[(ty * width * 4) as usize..((ty + 1) * width * 4) as usize];
-        for tx in 0..width as usize {
-            let n = counts[tx].max(1);
-            for c in 0..4 {
-                dst[tx * 4 + c] = ((acc[tx * 4 + c] + n / 2) / n) as u8;
-            }
+        let rows = (y1 - y0) as usize;
+        let dst = &mut out.data[ty as usize * width as usize * 4..(ty as usize + 1) * width as usize * 4];
+        for ((d, a), &(x0, x1)) in dst.chunks_exact_mut(4).zip(acc.chunks_exact(4)).zip(&spans) {
+            // Each sum is at most 255 for every pixel averaged; a span that could overflow 32
+            // bits would be 16 million pixels to one, far past anything asked for.
+            let n = ((x1 - x0) * rows) as u32;
+            let half = n / 2;
+            d[0] = ((a[0] + half) / n) as u8;
+            d[1] = ((a[1] + half) / n) as u8;
+            d[2] = ((a[2] + half) / n) as u8;
+            d[3] = ((a[3] + half) / n) as u8;
         }
     }
     Some(out)

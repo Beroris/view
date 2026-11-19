@@ -54,8 +54,10 @@ pub fn show(app: &App, x: i32, y: i32) -> Option<Cmd> {
     let s = &app.settings;
     if app.editor.is_some() {
         let saving = app.editor.as_ref().is_some_and(|e| e.saving);
+        let over = app.can_save_over();
         let entries = vec![
-            item("Save a copy", "Enter", Cmd::EditSave, !saving),
+            item("Save", if over { "Enter" } else { "" }, Cmd::EditSave, !saving && over),
+            item("Save a copy", if over { "Ctrl+Shift+S" } else { "Enter" }, Cmd::EditSaveCopy, !saving),
             item("Reset", "", Cmd::EditReset, !saving),
             item("Cancel", "Esc", Cmd::EditCancel, !saving),
             Entry::Separator,
@@ -67,10 +69,36 @@ pub fn show(app: &App, x: i32, y: i32) -> Option<Cmd> {
         ];
         return crate::popup::show(app, &entries, x, y, app.ui.menu_anchor.is_some());
     }
+    if let Some(t) = &app.trim {
+        let saving = t.saving.is_some();
+        let over = app.can_save_over();
+        let paused = app.player().is_none_or(|p| p.paused() || p.ended);
+        let picked = t.selected.and_then(|i| t.parts.get(i));
+        let entries = vec![
+            item("Save", if over { "Enter" } else { "" }, Cmd::EditSave, !saving && over),
+            item("Save a copy", if over { "Ctrl+Shift+S" } else { "Enter" }, Cmd::EditSaveCopy, !saving),
+            item("Undo", "Ctrl+Z", Cmd::Undo, !saving && t.can_undo()),
+            item("Redo", "Ctrl+Y", Cmd::Redo, !saving && t.can_redo()),
+            item("Reset", "", Cmd::EditReset, !saving),
+            item("Cancel", "Esc", Cmd::EditCancel, !saving),
+            Entry::Separator,
+            item(if paused { "Play" } else { "Pause" }, "Space", Cmd::PlayPause, !saving),
+            item("Start here", "I", Cmd::TrimMark(true), !saving),
+            item("End here", "O", Cmd::TrimMark(false), !saving),
+            Entry::Separator,
+            item("Split here", "S", Cmd::TrimSplit, !saving),
+            item("Delete the part", "Del", Cmd::TrimDelete, !saving && picked.is_some()),
+            item(if picked.is_some_and(|p| p.silent) { "Give the part its sound back" } else { "Remove the part's sound" }, "", Cmd::TrimPartSound, !saving && picked.is_some() && t.sound),
+            check("Remove the sound", "", Cmd::TrimSound, t.mute && t.sound),
+            Entry::Separator,
+            check("Full screen", "F11", Cmd::Fullscreen, app.is_fullscreen()),
+            item("About View", "F1", Cmd::About, true),
+        ];
+        return crate::popup::show(app, &entries, x, y, app.ui.menu_anchor.is_some());
+    }
     let has = app.shown.as_ref().is_some_and(|x| x.picture.is_some());
     let file = app.folder.current().is_some();
     let fitted = app.vp.is_fitted();
-    let actual = !fitted && (app.vp.view.scale - 1.0).abs() < 1e-6;
     let editable = app.shown.as_ref().and_then(|x| x.picture.as_ref()).is_some_and(|p| !p.is_animated() && !p.streams) && app.peek.is_none();
 
     let mut sort: Vec<Entry> = SortKey::ALL.iter().map(|&k| radio(k.label(), Cmd::Sort(k), s.sort == k)).collect();
@@ -117,41 +145,97 @@ pub fn show(app: &App, x: i32, y: i32) -> Option<Cmd> {
         check("Remember video positions after closing", "", Cmd::ResumeVideos, s.resume_videos),
         check("Ask before deleting", "", Cmd::ConfirmDelete, s.confirm_delete),
         check("Esc closes View", "", Cmd::EscapeCloses, s.escape_closes),
+        check("Update View automatically", "", Cmd::AutoUpdate, s.check_updates),
     ];
+    // An update waiting to be had goes in the menu itself; otherwise checking for one is an
+    // option, beside updating automatically.
+    let (update, can_update) = app.update.menu_item();
+    let waiting = can_update && update != "Check for updates";
+    let mut options = options;
+    if !waiting && app.peek.is_none() {
+        options.push(Entry::Separator);
+        options.push(item(&update, "", Cmd::Update, can_update));
+    }
 
-    let entries = vec![
-        item("Open…", "Ctrl+O", Cmd::Open, true),
-        item("Open with…", "", Cmd::OpenWith, file),
-        item("Show in folder", "Ctrl+E", Cmd::Reveal, file),
-        Entry::Separator,
-        item("Copy image", "Ctrl+C", Cmd::CopyImage, has),
-        item("Copy file", "Ctrl+Alt+C", Cmd::CopyFile, file),
-        item("Copy path", "Ctrl+Shift+C", Cmd::CopyPath, file),
-        Entry::Separator,
-        item("Rotate right", "R", Cmd::RotateCw, has),
-        item("Rotate left", "Shift+R", Cmd::RotateCcw, has),
-        item("Flip horizontally", "H", Cmd::FlipH, has),
-        item("Flip vertically", "V", Cmd::FlipV, has),
-        item("Save rotation", "Ctrl+S", Cmd::SaveRotation, has && app.user != view_core::orient::Orient::IDENTITY),
-        Entry::Separator,
-        item("Edit…", "E", Cmd::Edit, editable),
-        item("Set as desktop background", "", Cmd::SetWallpaper, has && app.peek.is_none()),
-        Entry::Separator,
-        Entry::Item { label: "Fit to window".into(), key: "Ctrl+0", cmd: Cmd::Fit, mark: if fitted { Mark::Tick } else { Mark::None }, enabled: has },
-        Entry::Item { label: "Actual size".into(), key: "Ctrl+1", cmd: Cmd::Actual, mark: if actual { Mark::Tick } else { Mark::None }, enabled: has },
-        check("Full screen", "F11", Cmd::Fullscreen, app.is_fullscreen()),
-        check("All files as a grid", "G", Cmd::Grid, app.grid.is_some()),
-        check("Information", "I", Cmd::Info, s.info_panel),
-        Entry::Separator,
-        sub("Sort by", sort),
-        sub("Appearance", look),
-        sub("Options", options),
-        Entry::Separator,
-        item("Undo delete", "Ctrl+Z", Cmd::Undo, app.can_undo()),
-        item("Delete", "Del", Cmd::Delete, file),
-        item("Properties", "Ctrl+Enter", Cmd::Properties, file),
-        item("About View", "F1", Cmd::About, true),
-    ];
+    // Only what applies to what's showing: no greyed-out lines. Everything left out still has
+    // its key, and the rarer things sit in submenus.
+    let video = app.player().is_some_and(|p| p.has_video() && p.error.is_none()) && app.peek.is_none();
+    let mut entries = vec![item("Open…", "Ctrl+O", Cmd::Open, true)];
+    if file {
+        entries.push(item("Open with…", "", Cmd::OpenWith, true));
+        entries.push(item("Show in folder", "Ctrl+E", Cmd::Reveal, true));
+    }
+    entries.push(Entry::Separator);
+    let mut copy = Vec::new();
+    if has {
+        copy.push(item("Copy image", "Ctrl+C", Cmd::CopyImage, true));
+    }
+    if file {
+        copy.push(item("Copy file", "Ctrl+Alt+C", Cmd::CopyFile, true));
+        copy.push(item("Copy path", "Ctrl+Shift+C", Cmd::CopyPath, true));
+    }
+    if !copy.is_empty() {
+        entries.push(sub("Copy", copy));
+    }
+    if has {
+        entries.push(sub("Rotate and flip", vec![
+            item("Rotate right", "R", Cmd::RotateCw, true),
+            item("Rotate left", "Shift+R", Cmd::RotateCcw, true),
+            item("Flip horizontally", "H", Cmd::FlipH, true),
+            item("Flip vertically", "V", Cmd::FlipV, true),
+            Entry::Separator,
+            item("Save rotation", "Ctrl+S", Cmd::SaveRotation, app.user != view_core::orient::Orient::IDENTITY),
+        ]));
+    }
+    if video {
+        entries.push(item("Trim…", "E", Cmd::Edit, true));
+    } else if editable {
+        entries.push(item("Edit…", "E", Cmd::Edit, true));
+    }
+    if has && app.peek.is_none() {
+        entries.push(item("Set as desktop background", "", Cmd::SetWallpaper, true));
+    }
+    entries.push(Entry::Separator);
+    // One line for zoom: whichever of the two it isn't at.
+    if has {
+        entries.push(match fitted {
+            true => item("Actual size", "Ctrl+1", Cmd::Actual, true),
+            false => item("Fit to window", "Ctrl+0", Cmd::Fit, true),
+        });
+    }
+    entries.push(check("Full screen", "F11", Cmd::Fullscreen, app.is_fullscreen()));
+    if file {
+        entries.push(check("All files as a grid", "G", Cmd::Grid, app.grid.is_some()));
+        entries.push(check("Information", "I", Cmd::Info, s.info_panel));
+    }
+    entries.push(Entry::Separator);
+    entries.push(sub("Sort by", sort));
+    entries.push(sub("Appearance", look));
+    entries.push(sub("Options", options));
+    entries.push(Entry::Separator);
+    if app.can_undo() {
+        entries.push(item(app.undo_label(), "Ctrl+Z", Cmd::Undo, true));
+    }
+    if file {
+        entries.push(item("Delete", "Del", Cmd::Delete, true));
+        entries.push(item("Properties", "Ctrl+Enter", Cmd::Properties, true));
+    }
+    entries.push(Entry::Separator);
+    if waiting && app.peek.is_none() {
+        entries.push(item(&update, "", Cmd::Update, true));
+    }
+    entries.push(item("About View", "F1", Cmd::About, true));
+    // No separator first, last, or twice over where a group came out empty.
+    let mut tidy: Vec<Entry> = Vec::with_capacity(entries.len());
+    for e in entries {
+        if matches!(e, Entry::Separator) && tidy.last().is_none_or(|l| matches!(l, Entry::Separator)) {
+            continue;
+        }
+        tidy.push(e);
+    }
+    if matches!(tidy.last(), Some(Entry::Separator)) {
+        tidy.pop();
+    }
     // From the toolbar it opens upwards, since the toolbar is at the bottom.
-    crate::popup::show(app, &entries, x, y, app.ui.menu_anchor.is_some())
+    crate::popup::show(app, &tidy, x, y, app.ui.menu_anchor.is_some())
 }

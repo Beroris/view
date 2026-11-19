@@ -12,6 +12,8 @@ image.workspace = true
 kamadak-exif.workspace = true
 # Inflating 3MF packages. Already part of the build through the PNG decoder.
 miniz_oxide = "0.8"
+# Checking a downloaded update against the SHA-256 its release lists.
+sha2 = "0.10"
 
 [dev-dependencies]
 # Only for examples/fixtures.rs, which writes test images. None of this reaches View itself.

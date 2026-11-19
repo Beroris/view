@@ -16,7 +16,8 @@ A fast viewer for Windows: photos first, and videos and music too. Double-click 
 - **Copy and share.** Copy the image (as a PNG and a bitmap, so it pastes anywhere), the file itself, or its path. Open the folder with the file selected, open it with another app, or see its Windows properties.
 - **Delete to the Recycle Bin**, with a confirmation you can turn off. It moves on to the next picture, and an Undo button (or Ctrl+Z) puts the file straight back.
 - **Filmstrip and grid.** A strip of thumbnails above the toolbar shows where you are in the folder; click one to jump to it, or scroll over it to flip through. Press G for every file in the folder as a grid of thumbnails: arrow keys or the mouse to pick, Enter to open, + and − (or Ctrl and the wheel) for bigger or smaller thumbnails.
-- **Edit a copy.** Press E to crop (free, or to the original shape, square, 4:3, 3:2 or 16:9), turn, straighten, and change brightness, contrast, saturation and warmth. Save a copy writes `Photo (edited).jpg` beside the original, which is never changed.
+- **Edit photos.** Press E to crop (free, or to the original shape, square, 4:3, 3:2 or 16:9), turn, straighten, and change brightness, contrast, saturation and warmth. Save writes over a JPEG or PNG, with Undo there if you change your mind; Save a copy writes `Photo (edited).jpg` beside the original instead.
+- **Trim and split videos.** Press E on a video, or click the scissors, and drag the two handles to keep just the part you want, or press I and O to start and end where it's playing. Press S (or Split) to cut the video in two where it's playing, as often as you like; click a part to pick it, then press Delete to take it out and the bar closes up over the gap, or remove just that part's sound so the picture plays on silent. Ctrl+Z undoes a step and Ctrl+Y does it again. The bar shows the sound in a lane of its own, so you can see what's silent, and the time reads where you are in the video as it'll be saved, out of how long it'll be. Splits can be dragged to move them. The picture is copied across as it is, never re-encoded, so it's quick and loses nothing; the catch is that a piece of video can only start on a key frame, so the start, and the split after a deleted part, snap back to the nearest one. Works with H.264 and HEVC videos (most phone and camera ones), and saves over an MP4 or MOV, with Undo, or as a copy.
 - **Drag a photo out** into an email, a chat or another folder: hold Ctrl and drag, or just drag when the whole picture fits on screen in full screen. **Set as desktop background** is in the menu.
 - **Information panel.** Size, format, colour space, bit depth, frames, file dates, and the camera's details: camera, lens, exposure, aperture, ISO, focal length, flash, white balance and location. Drag across any of it, or double-click a word, to select it and copy it with Ctrl+C. The same goes for messages, dialogs and the Space preview's file cards.
 - **Videos and music.** Videos and songs sit in the folder with your pictures and play right there, through Windows' own Media Foundation, so whatever Windows can play, View can. Click to play or pause, drag along the bar to seek, and double-click for full screen. Point at the speaker button and a volume slider slides out beside it. Songs show their cover, title, artist and album. Play faster or slower (0.25× to 2×) from the speed button or with > and <. Step a paused video a frame at a time with , and ., and Ctrl+C copies the frame on screen. Go to another file and back and a video carries on where you left it; turn on "Remember video positions after closing" (Options) and it does after you close View too, which suits films.
@@ -64,7 +65,7 @@ If a codec is missing, View says which extension to install instead of failing q
 | Delete | Move to the Recycle Bin |
 | Ctrl+Z | Put back the last file deleted |
 | G | All files in the folder as a grid |
-| E | Edit a copy: crop, straighten, light and colour |
+| E | Edit a photo (crop, straighten, light and colour) or trim a video |
 | > / < (video) | Faster / slower |
 | Ctrl+O | Open a file |
 | Ctrl+E | Show in its folder |
@@ -80,6 +81,12 @@ If a codec is missing, View says which extension to install instead of failing q
 Download **View-&lt;version&gt;-Setup.exe** from [Releases](https://github.com/Beroris/view/releases/latest) and run it. It installs for you only, so it doesn't ask for admin rights. It adds View to the Start menu and to "Open with" for images. To make View the default, tick the last option in the installer, or go to Settings → Apps → Default apps → View. Uninstall it from Settings → Apps like any other app.
 
 To run View without installing, download **View-&lt;version&gt;-Portable.exe** instead. Run it from anywhere, a USB stick included. It keeps its settings in a "View settings" folder beside itself rather than in your profile.
+
+Both keep themselves up to date. A few seconds after a window opens, at most once a day, View looks at its releases here; a newer one downloads in the background, is checked against the SHA-256 GitHub lists for it, and goes in when you close View. "Install View … now" in the menu does it straight away and opens your file again. "Check for updates" in Options looks right away, and "Update View automatically" there turns it off.
+
+### Linux and macOS
+
+There's a lean build for Linux and macOS, `bero-view`, on the same engine. It opens JPEG, PNG, GIF, WebP, BMP, TIFF and ICO, with animation, and has the browsing, zooming, rotating, information panel, delete-to-bin and copy of the Windows app. It decodes and draws everything itself, so it needs no GPU, toolkit or system codecs. It doesn't have the rest yet: video and music, PDFs and documents, editing, text in photos, the grid and filmstrip, colour profile conversion, or HEIC, AVIF, JPEG XL and RAW. There are no packages yet, so build it from source (below). It is new and has only been run on Windows so far; for Linux and macOS it is known to compile, and no more than that.
 
 ## Resource use
 
@@ -102,6 +109,7 @@ You need Rust 1.85 or newer.
 
 ```sh
 cargo build --release -p view-windows        # target/release/view.exe
+cargo build --release -p view-desktop        # target/release/bero-view, for Linux and macOS
 cargo test --workspace
 pwsh scripts/package-windows.ps1             # dist/: the installer and the portable exe (needs Inno Setup 6)
 ```
@@ -111,6 +119,8 @@ Other tools:
 ```sh
 cargo run --release -p view-core --example fixtures -- <dir>   # test images: orientation, colour profiles, animation, damaged files…
 cargo run --release -p view-core --example pdftext -- <pdfs>   # the text View finds in PDFs, page by page, with timings
+cargo run --release -p view-core --example decodebench -- <files>   # timings for View's own decoders
+bero-view --render <picture> <out.png>                         # draw one frame to a file with no window, with timings
 view.exe --decode-bench <files>                                # decode timings, written to %TEMP%\view-bench.txt
 set VIEW_TRACE=1                                               # startup and decode timings in %TEMP%\view-trace.txt
 node scripts/gen_icon.mjs                                      # redraw the icon
@@ -122,12 +132,13 @@ node scripts/gen_icon.mjs                                      # redraw the icon
 |---|---|
 | `crates/view-core` | Platform-neutral: folder scanning and natural sorting, zoom and pan, the decoded-image cache, EXIF orientation and metadata, colour profile names, settings, the GIF, WebP and APNG decoders, the STL, 3MF and OBJ readers, the PDF text reader (with decryption for PDFs that open without a password), the zip, Word and Excel readers, PowerPoint slides laid out with their layouts, masters and themes, and the text, Markdown and CSV parsing behind the previews, and the photo edits (crop, straighten, light and colour). No OS calls. |
 | `platforms/windows` | The Windows app: Win32, Direct2D on Direct3D 11, WIC for decoding and colour management, DirectWrite, Media Foundation for video and music, Windows' PDF renderer, and Direct3D for 3D models. |
+| `platforms/desktop` | `bero-view`, for Linux and macOS: winit for the window, every pixel decoded and drawn on the CPU across all cores. `packaging/bero-view.desktop` is the menu entry for Linux. |
 | `installer` | The setup wizard (Inno Setup), built by `scripts/package-windows.ps1`. |
 | `assets/fonts` | Geist, the interface font, built into the exe (SIL Open Font License; see `Geist-LICENSE.txt`). |
 
 ## Privacy
 
-View never connects to the internet. There's no account, no telemetry and no update check. Settings are in `%APPDATA%\View\settings.json`.
+There's no account and no telemetry. The one thing View does online is look for a new version: once a day at most, it asks GitHub what the latest release is, and downloads it from github.com if it's newer. It sends nothing about you or your files. Turn off "Update View automatically" in Options and View never connects to the internet at all. Settings are in `%APPDATA%\View\settings.json`.
 
 ## License
 

@@ -111,17 +111,29 @@ impl Orient {
 
 /// Turn a packed 4-byte-per-pixel image upright. Returns the new width and height.
 pub fn apply(o: Orient, w: u32, h: u32, src: &[u8]) -> (u32, u32, Vec<u8>) {
-    if o == Orient::IDENTITY {
+    if o == Orient::IDENTITY || w == 0 || h == 0 {
         return (w, h, src.to_vec());
     }
     let (ow, oh) = o.shown_size(w, h);
     let mut out = vec![0u8; src.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let (nx, ny) = o.map(x, y, w, h);
-            let s = ((y * w + x) * 4) as usize;
-            let d = ((ny * ow + nx) * 4) as usize;
-            out[d..d + 4].copy_from_slice(&src[s..s + 4]);
+    // Each stored row lands as a straight run in the upright image: a row, or a column, forwards
+    // or backwards. So one row needs only where its first pixel goes and the step to the next.
+    let index = |x: u32, y: u32| {
+        let (nx, ny) = o.map(x, y, w, h);
+        (ny as usize * ow as usize + nx as usize) as isize
+    };
+    let step = if w > 1 { index(1, 0) - index(0, 0) } else { 0 };
+    for (y, row) in src.chunks_exact(w as usize * 4).take(h as usize).enumerate() {
+        let mut d = index(0, y as u32);
+        if step == 1 {
+            let at = d as usize * 4;
+            out[at..at + row.len()].copy_from_slice(row);
+            continue;
+        }
+        for px in row.chunks_exact(4) {
+            let at = d as usize * 4;
+            out[at..at + 4].copy_from_slice(px);
+            d += step;
         }
     }
     (ow, oh, out)
@@ -194,6 +206,25 @@ mod tests {
                 let (tx, ty) = Orient::IDENTITY.rotated_cw().map(x, y, w, h);
                 let by_hand = (h - 1 - tx, ty); // mirror within the turned 2×3
                 assert_eq!(o.map(x, y, w, h), by_hand);
+            }
+        }
+    }
+
+    /// Every orientation puts every pixel where `map` says, for sizes with one row or column too.
+    #[test]
+    fn apply_agrees_with_map() {
+        for (w, h) in [(5u32, 3u32), (1, 4), (4, 1), (1, 1)] {
+            let src: Vec<u8> = (0..w * h).flat_map(|i| [i as u8, 0, 0, 255]).collect();
+            for v in 1..=8 {
+                let o = Orient::from_exif(v);
+                let (ow, oh, out) = apply(o, w, h, &src);
+                assert_eq!((ow, oh), o.shown_size(w, h));
+                for y in 0..h {
+                    for x in 0..w {
+                        let (nx, ny) = o.map(x, y, w, h);
+                        assert_eq!(out[((ny * ow + nx) * 4) as usize], (y * w + x) as u8, "orientation {v}, {w}x{h}, pixel {x},{y}");
+                    }
+                }
             }
         }
     }

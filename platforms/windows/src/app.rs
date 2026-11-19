@@ -61,6 +61,15 @@ pub const WM_ART: u32 = WM_APP + 6;
 pub const WM_OCR: u32 = WM_APP + 8;
 /// Read the words in a photo once it's been on screen a moment.
 const TIMER_OCR: usize = 8;
+/// Paints the next frame of an animation while the window is covered, when showing a frame
+/// no longer waits for the display.
+const TIMER_FRAME: usize = 9;
+/// Hands the player a speed once a run of speed changes has stopped.
+const TIMER_SPEED: usize = 10;
+/// Puts the speeds away a moment after one is picked, once the mark has slid to it.
+const TIMER_SPEEDS: usize = 11;
+/// A few seconds after the window opens: look for a new version, if it's time to.
+const TIMER_UPDATE: usize = 12;
 /// Where the words read off a photo are left: the photo, how it was turned, and the words.
 type OcrSlot = Arc<Mutex<Option<(PathBuf, Orient, Option<view_core::pdftext::PageText>)>>>;
 
@@ -153,6 +162,8 @@ enum Drag {
     Text,
     /// Placing the caret or selecting in the find or page box.
     Field,
+    /// Dragging a table in the preview about, from this point.
+    Scroll { x: i32, y: i32 },
     /// Moving the preview, held this far from its top-left corner (in screen pixels).
     Move { dx: i32, dy: i32 },
     /// Pressed on the picture where dragging takes the file out to another app, from here.
@@ -163,6 +174,9 @@ enum Drag {
     Crop,
     /// Moving one of the editor's sliders.
     Slider(u8),
+    /// Moving the trimmed video's start (0) or end (1), held this far from it, or where it's
+    /// playing (2).
+    Trim(u8, i32),
 }
 
 struct Saved {
@@ -228,10 +242,18 @@ pub struct App {
     dead_key: Option<(u16, isize)>,
     /// How fast videos and songs play, for as long as View is open.
     pub speed: f64,
-    /// Files moved to the Recycle Bin from here, the last one last, for Undo.
-    deleted: Vec<PathBuf>,
-    /// The "Moved to the Recycle Bin" message has an Undo button until then.
+    /// When the speed was last changed, for telling one change from a run of them.
+    speed_set_at: Instant,
+    /// New versions of View: looking, downloading and installing.
+    pub update: crate::update::Updater,
+    /// Just went between the photo and the grid: when, and whether into the grid.
+    pub screen_switch: Option<(Instant, bool)>,
+    /// What Undo can put back, the last thing done last.
+    pub undo: Vec<Undo>,
+    /// The "Moved to the Recycle Bin" or "Saved" message has an Undo button until then.
     pub undo_until: Option<Instant>,
+    /// A video being trimmed.
+    pub trim: Option<crate::trim::Trim>,
     /// Thumbnails for the filmstrip and the grid.
     pub thumbs: crate::thumbs::Thumbs,
     /// Every file in the folder as thumbnails, while that's up.
@@ -257,10 +279,23 @@ pub struct Grid {
     pub follow: bool,
 }
 
+/// Something Undo can put back.
+pub enum Undo {
+    /// A file moved to the Recycle Bin.
+    Delete(PathBuf),
+    /// A photo saved over: the file, and a copy of it as it was before.
+    Save { path: PathBuf, before: PathBuf },
+}
+
 /// Work done off the window's thread, finished.
 enum Finished {
     /// A photo saved as a copy: where, or why not.
     Copy(Result<PathBuf, String>),
+    /// A photo saved over: the file and where it was kept as it was, or why not.
+    Saved(Result<(PathBuf, PathBuf), String>),
+    /// A video trimmed: the original, the file written, and whether it's to go over the
+    /// original; or why not.
+    Trimmed(Result<(PathBuf, PathBuf, bool), String>),
     /// The desktop background set.
     Wallpaper(Result<(), String>),
 }
@@ -362,7 +397,12 @@ impl App {
     /// The part of the window the image is shown in: all of it. The information card floats
     /// over the picture rather than pushing it aside.
     pub fn area(&self) -> (f32, f32) {
-        self.client_size()
+        let (w, h) = self.client_size();
+        // The video stays clear of the trimming controls under it.
+        if self.trim.is_some() {
+            return (w, (h - (ui::TRIM_ROOM * self.scale()).round()).max(1.0));
+        }
+        (w, h)
     }
 
     /// The view right now, partway through a zoom if one is moving.
@@ -401,12 +441,14 @@ impl App {
     pub fn animating(&self) -> bool {
         self.tween.is_some()
             || self.ui.fading()
+            || self.screen_switch.is_some()
             || self.crossfade() < 1.0
             || self.player().is_some_and(|p| p.playing() && p.has_video())
             || self.peek.as_ref().and_then(|p| p.doc.as_ref()).is_some_and(|d| d.scrolling())
             || self.selection_overshoot() != 0.0
             || self.grid.as_ref().is_some_and(|g| (g.scroll - g.target).abs() > 0.5)
             || self.strip_moving()
+            || self.trim.as_ref().is_some_and(|t| t.saving.is_some())
     }
 
     /// While text is being selected with the mouse past the top or bottom edge band of the
@@ -1060,10 +1102,17 @@ impl App {
         let n = self.folder.len();
         let wrap = self.settings.wrap;
         let entries = &self.folder.entries;
+        // Only the files within reach are looked at, not the whole folder: anything further is
+        // dropped whatever its distance, and a folder can hold tens of thousands of files.
         let distance = |p: &Path| {
-            let i = entries.iter().position(|e| e.path == p)?;
-            let d = i.abs_diff(index);
-            Some(if wrap { d.min(n - d) } else { d })
+            if n == 0 || index >= n {
+                return None;
+            }
+            (0..=CACHE_REACH.min(n - 1)).find(|&d| {
+                let ahead = if wrap { Some((index + d) % n) } else { Some(index + d).filter(|&i| i < n) };
+                let behind = if wrap { Some((index + n - d % n) % n) } else { index.checked_sub(d) };
+                [ahead, behind].into_iter().flatten().any(|i| entries[i].path == p)
+            })
         };
         let current = self.shown.as_ref().map(|s| s.path.clone());
         let pinned: Vec<&Path> = current.iter().map(|p| p.as_path()).collect();
@@ -1456,18 +1505,27 @@ impl App {
         if self.dialog.is_some() {
             return;
         }
-        if self.editor.is_some() && !cmd.while_editing() {
+        if self.trim.is_some() && matches!(cmd, Cmd::Undo | Cmd::Redo) {
+            return self.trim_undo(cmd == Cmd::Redo);
+        }
+        if (self.editor.is_some() || self.trim.is_some()) && !cmd.while_editing() {
             return;
         }
         let has_image = self.shown.as_ref().is_some_and(|s| s.picture.is_some());
         let path = self.folder.current().map(|e| e.path.clone());
         match cmd {
             Cmd::ZoomIn | Cmd::ZoomOut if self.grid.is_some() => self.grid_resize(cmd == Cmd::ZoomIn),
-            Cmd::Speed(i) => self.set_speed(crate::cmd::SPEEDS[(i as usize).min(crate::cmd::SPEEDS.len() - 1)]),
+            Cmd::Speed(i) => {
+                self.set_speed(crate::cmd::SPEEDS[(i as usize).min(crate::cmd::SPEEDS.len() - 1)]);
+                if self.ui.speeds_out() {
+                    unsafe { SetTimer(Some(self.hwnd), TIMER_SPEEDS, 420, None) };
+                }
+            }
             Cmd::Faster | Cmd::Slower => self.speed_step(cmd == Cmd::Faster, false),
-            Cmd::SpeedMenu => self.speed_menu(),
+            Cmd::SpeedMenu => self.show_speeds(!self.ui.speeds_out()),
             Cmd::SetWallpaper => self.set_wallpaper(),
-            Cmd::Undo => self.undo_delete(),
+            Cmd::Undo => self.undo(),
+            Cmd::Redo => {}
             Cmd::Grid => self.toggle_grid(),
             Cmd::Filmstrip => {
                 self.settings.filmstrip = !self.settings.filmstrip;
@@ -1475,7 +1533,7 @@ impl App {
                 self.changed();
             }
             Cmd::Edit => self.start_edit(),
-            Cmd::EditSave | Cmd::EditCancel | Cmd::EditReset | Cmd::EditAspect(_) | Cmd::EditTurn(_) => self.edit_command(cmd),
+            Cmd::EditSave | Cmd::EditSaveCopy | Cmd::EditCancel | Cmd::EditReset | Cmd::EditAspect(_) | Cmd::EditTurn(_) | Cmd::TrimSound | Cmd::TrimMark(_) | Cmd::TrimSplit | Cmd::TrimDelete | Cmd::TrimPartSound => self.edit_command(cmd),
             Cmd::Open => {
                 let exts = self.extensions.lock().unwrap().clone();
                 let exts = if exts.is_empty() { supported_extensions() } else { exts };
@@ -1544,6 +1602,13 @@ impl App {
                     let ok = shell::copy_text(self.hwnd, &text);
                     self.say(if ok { "Copied" } else { "Couldn't copy the text" });
                 }
+            }
+            Cmd::ShowText(text) => {
+                if let Some(doc) = self.peek.as_mut().and_then(|p| p.doc.as_mut()) {
+                    doc.show_text(text);
+                }
+                self.selection_changed();
+                self.invalidate();
             }
             Cmd::Find => self.open_bar(BarKind::Find),
             Cmd::GoToPage => self.open_bar(BarKind::Page),
@@ -1619,6 +1684,7 @@ impl App {
                     self.peek_hide();
                 }
             }
+            Cmd::PlayPause if self.trim.is_some() => self.trim_play(),
             Cmd::PlayPause => {
                 if let Some(p) = self.player_mut() {
                     p.toggle();
@@ -1769,6 +1835,29 @@ impl App {
                 self.settings.escape_closes = !self.settings.escape_closes;
                 self.changed();
             }
+            Cmd::AutoUpdate => {
+                self.settings.check_updates = !self.settings.check_updates;
+                self.changed();
+            }
+            Cmd::Update => match self.update.press(self.hwnd) {
+                crate::update::Press::Say(line) => self.say_for(&line, Duration::from_secs(3)),
+                crate::update::Press::Nothing => {}
+                crate::update::Press::Install => {
+                    // Saved first, so the new version opens where this one was.
+                    self.remember_placement();
+                    self.save_settings();
+                    let reopen = self.folder.current().map(|e| e.path.clone());
+                    match self.update.install_now(reopen.as_deref()) {
+                        // The portable copy has started its new version: this one goes.
+                        Ok(true) => unsafe {
+                            let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        },
+                        // Setup closes this window itself, in a moment.
+                        Ok(false) => self.say_for("Installing the new version\u{2026}", Duration::from_secs(20)),
+                        Err(error) => self.say_for(&error, Duration::from_secs(4)),
+                    }
+                }
+            },
         }
     }
 
@@ -1861,7 +1950,7 @@ impl App {
                 if let Some(g) = &mut self.grid {
                     g.selected = g.selected.min(self.folder.len().saturating_sub(1));
                 }
-                self.deleted.push(path.to_path_buf());
+                self.undo.push(Undo::Delete(path.to_path_buf()));
                 self.say_for("Moved to the Recycle Bin", tools::UNDO_TIME);
                 self.undo_until = Some(Instant::now() + tools::UNDO_TIME);
             }
@@ -2074,19 +2163,29 @@ impl App {
 
     fn paint(&mut self) {
         self.follow_selection();
+        self.trim_tick();
         let Some(mut gpu) = self.gpu.take() else { return };
         // A 3D model is drawn by Direct3D first, for Direct2D to put on screen.
         if let (Some(m), Some(d3d)) = (self.peek.as_mut().and_then(|p| p.model.as_mut()), &self.d3d) {
             m.prepare(d3d, &gpu, gpu.width, gpu.height, self.palette.dark);
         }
+        if self.screen_switch.is_some_and(|(at, _)| at.elapsed() >= ui::SCREEN_SWITCH) {
+            self.screen_switch = None;
+            gpu.drop_kept();
+        }
+        let started = Instant::now();
         gpu.begin();
         ui::draw(self, &mut gpu);
+        let drawn = started.elapsed();
         let result = gpu.end();
         self.gpu = Some(gpu);
-        if result.is_err() {
+        if util::tracing() {
+            trace(&format!("frame: drawn in {:.2} ms, shown after {:.2} ms", drawn.as_secs_f64() * 1000.0, started.elapsed().as_secs_f64() * 1000.0));
+        }
+        let Ok(visible) = result else {
             self.lost_device();
             return;
-        }
+        };
         if self.crossfade() >= 1.0 {
             if let Some(s) = &mut self.shown {
                 s.fading = None;
@@ -2100,8 +2199,27 @@ impl App {
                 }
             }
         }
+        // Showing a frame normally waits for the display, which is what paces an animation.
+        // It doesn't when the window is covered or the screen is off, and then frames would be
+        // drawn as fast as a core can go. Two frames in under half the display's own frame time
+        // means nothing is waiting, so a timer paces the next second of them instead.
+        thread_local! {
+            static LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+            static UNPACED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+        }
+        let spinning = LAST.replace(Some(started)).is_some_and(|l| {
+            let gap = started.duration_since(l);
+            gap < Duration::from_millis(4) && gap.as_secs_f64() < 0.5 / util::refresh_rate()
+        });
+        if spinning || !visible {
+            UNPACED.set(Some(started));
+        }
         if self.animating() {
-            self.invalidate();
+            if UNPACED.get().is_some_and(|since| since.elapsed() < Duration::from_secs(1)) {
+                unsafe { SetTimer(Some(self.hwnd), TIMER_FRAME, if visible { 10 } else { 100 }, None) };
+            } else {
+                self.invalidate();
+            }
         }
     }
 
@@ -2191,6 +2309,10 @@ impl App {
                 self.invalidate();
             }
         }
+        if let Some(Drag::Trim(which, dx)) = self.drag {
+            self.trim_drag(which, x - dx, false);
+            return;
+        }
         if let Some(Drag::Seek) = self.drag {
             let f = self.ui.seek_fraction(x as f32);
             self.seek_to(f, false);
@@ -2246,6 +2368,14 @@ impl App {
             self.invalidate();
             return;
         }
+        if let Some(Drag::Scroll { x: px, y: py }) = self.drag {
+            if let Some(doc) = self.peek.as_mut().and_then(|p| p.doc.as_mut()) {
+                doc.drag_by((py - y) as f32, (px - x) as f32);
+            }
+            self.drag = Some(Drag::Scroll { x, y });
+            self.invalidate();
+            return;
+        }
         if let Some(Drag::Pan { x: px, y: py, .. }) = self.drag {
             let (dx, dy) = (x - px, y - py);
             if dx != 0 || dy != 0 {
@@ -2283,6 +2413,11 @@ impl App {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_IDLE);
         }
+        // The controls stay while the speeds are out over them.
+        if self.ui.speeds_out() {
+            self.arm_idle();
+            return;
+        }
         let want = self.toolbar_wanted() && !(self.settings.toolbar == Toolbar::Hidden && !self.ui.over_controls);
         let want = if self.settings.toolbar == Toolbar::Always && !self.is_fullscreen() { !self.ui.hidden } else { want };
         self.ui.show(want);
@@ -2310,6 +2445,10 @@ impl App {
             return;
         }
         let hit = self.ui.hit(x as f32, y as f32);
+        // A press anywhere but on the speeds puts them away.
+        if self.ui.speeds_out() && !matches!(hit, Some(ui::Hit::Button(Cmd::Speed(_) | Cmd::SpeedMenu))) {
+            self.show_speeds(false);
+        }
         if hit == Some(ui::Hit::Field) {
             let shift = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
             self.field_click(x as f32, shift, false);
@@ -2337,11 +2476,48 @@ impl App {
                 self.invalidate();
                 return;
             }
+            if let ui::Hit::Trim(which) = hit {
+                // A handle keeps where it was taken hold of; the bar between plays from there.
+                let dx = match (self.trim_edge(which), self.trim.as_ref(), self.ui.seek_track) {
+                    (Some(at), Some(t), Some(track)) => x - (track.left + (track.right - track.left) * (t.to_line(at) / t.length()) as f32).round() as i32,
+                    _ => 0,
+                };
+                // Moving a handle or a split is one change, for Undo.
+                if which != 2 {
+                    if let Some(t) = &mut self.trim {
+                        t.remember();
+                    }
+                }
+                self.drag = Some(Drag::Trim(which, dx));
+                self.ui.pressed = Some(hit);
+                self.trim_drag(which, x - dx, false);
+                return;
+            }
             if hit == ui::Hit::Seek {
                 self.drag = Some(Drag::Seek);
                 self.ui.pressed = Some(hit);
                 let f = self.ui.seek_fraction(x as f32);
                 self.seek_to(f, false);
+                return;
+            }
+            if hit == ui::Hit::Title {
+                // Held and dragged, the name moves the window, as a title bar would. Let go
+                // where it was, it shows or hides the information card.
+                let (mut before, mut after) = (RECT::default(), RECT::default());
+                self.ui.pressed = Some(hit);
+                self.invalidate();
+                unsafe {
+                    let _ = GetWindowRect(self.hwnd, &mut before);
+                    let _ = ReleaseCapture();
+                    let _ = SendMessageW(self.hwnd, WM_NCLBUTTONDOWN, Some(WPARAM(HTCAPTION as usize)), Some(LPARAM(0)));
+                    let _ = GetWindowRect(self.hwnd, &mut after);
+                }
+                self.ui.pressed = None;
+                self.drag = None;
+                if before == after {
+                    self.run(Cmd::Info);
+                }
+                self.invalidate();
                 return;
             }
             if hit == ui::Hit::Volume {
@@ -2378,6 +2554,12 @@ impl App {
                 doc.select_start(x as f32, y as f32, false);
                 self.drag = Some(Drag::Select);
                 self.selection_changed();
+                return;
+            }
+            // A table has no text to select, so dragging moves it: the way to its far columns
+            // with a mouse that has no sideways wheel.
+            if peek.doc.as_ref().is_some_and(|d| d.draggable()) {
+                self.drag = Some(Drag::Scroll { x, y });
                 return;
             }
         }
@@ -2468,7 +2650,7 @@ impl App {
                     }
                 }
             }
-            Some(Drag::Pan { .. }) | Some(Drag::Orbit { .. }) | Some(Drag::Volume) | Some(Drag::Field) | Some(Drag::Move { .. }) | Some(Drag::Out { .. }) => {}
+            Some(Drag::Scroll { .. }) | Some(Drag::Pan { .. }) | Some(Drag::Orbit { .. }) | Some(Drag::Volume) | Some(Drag::Field) | Some(Drag::Move { .. }) | Some(Drag::Out { .. }) => {}
             Some(Drag::Thumb { index, .. }) => {
                 if self.ui.hit(x as f32, y as f32) == Some(ui::Hit::Thumb(index as u32)) {
                     self.grid_open(index);
@@ -2501,6 +2683,7 @@ impl App {
                 let f = self.ui.seek_fraction(x as f32);
                 self.seek_to(f, true);
             }
+            Some(Drag::Trim(which, dx)) => self.trim_drag(which, x - dx, true),
             Some(Drag::Click) => self.run(Cmd::PlayPause),
             None => {
                 if self.folder.is_empty() && self.shown.is_none() {
@@ -2515,7 +2698,7 @@ impl App {
     }
 
     fn on_wheel(&mut self, delta: i32, x: i32, y: i32, ctrl: bool) {
-        if self.dialog.is_some() || self.editor.is_some() {
+        if self.dialog.is_some() || self.editor.is_some() || self.trim.is_some() {
             return;
         }
         if self.grid.is_some() {
@@ -2566,8 +2749,10 @@ impl App {
         }
         if let Some(doc) = self.peek.as_mut().and_then(|p| p.doc.as_mut()) {
             let step = -(delta as f32) / 120.0 * 64.0 * s;
-            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-            if shift && doc.can_scroll_sideways() { doc.scroll_by(0.0, step) } else { doc.scroll_by(step, 0.0) }
+            // Shift turns the wheel sideways. So does a table that's all on screen top to
+            // bottom: there's nowhere else for the wheel to take it.
+            let shift = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
+            if doc.can_scroll_sideways() && (shift || doc.fits_height()) { doc.scroll_by(0.0, step) } else { doc.scroll_by(step, 0.0) }
             self.ui.show(true);
             self.arm_idle();
             self.invalidate();
@@ -2605,6 +2790,9 @@ impl App {
         }
         if self.editor.is_some() {
             return self.editor_key(key, ctrl, shift, alt);
+        }
+        if self.trim.is_some() {
+            return self.trim_key(key, ctrl, shift, alt);
         }
         if self.grid.is_some() && self.grid_key(key, ctrl) {
             return true;
@@ -2656,6 +2844,10 @@ impl App {
             VK_RETURN if alt => Cmd::Fullscreen,
             VK_F => Cmd::Fullscreen,
             VK_ESCAPE => {
+                if self.ui.speeds_out() {
+                    self.show_speeds(false);
+                    return true;
+                }
                 if self.ui.pick.clear() {
                     self.selection_changed();
                     return true;
@@ -2706,7 +2898,7 @@ impl App {
         let mut buf = vec![0u16; 32768];
         let n = unsafe { DragQueryFileW(drop, 0, Some(&mut buf)) } as usize;
         unsafe { DragFinish(drop) };
-        if n == 0 || self.editor.is_some() {
+        if n == 0 || self.editor.is_some() || self.trim.is_some() {
             return;
         }
         self.grid = None;
@@ -2819,6 +3011,9 @@ impl App {
                 self.on_mouse_move(x, y);
                 Some(LRESULT(0))
             }
+            // A test build driven by posted messages: the real mouse is elsewhere, so Windows
+            // says it left at once. Never set for a release.
+            WM_MOUSELEAVE if option_env!("VIEW_TEST_MOUSE_STAYS").is_some() => Some(LRESULT(0)),
             WM_MOUSELEAVE => {
                 self.tracking = false;
                 self.ui.mouse_inside = false;
@@ -2840,6 +3035,10 @@ impl App {
             WM_LBUTTONDBLCLK => {
                 let (x, y) = point();
                 let hit = self.ui.hit(x as f32, y as f32);
+                if self.trim.is_some() {
+                    self.on_button_down(x, y);
+                    return Some(LRESULT(0));
+                }
                 if self.editor.is_some() {
                     // A double-click on a slider puts it back to the middle.
                     if let (Some(ui::Hit::Slider(i)), Some(ed)) = (hit, self.editor.as_mut()) {
@@ -2852,6 +3051,15 @@ impl App {
                 }
                 if self.grid.is_some() {
                     self.on_button_down(x, y);
+                    return Some(LRESULT(0));
+                }
+                if hit == Some(ui::Hit::Title) {
+                    // As on a title bar: maximise, or back. The first click of the two showed
+                    // or hid the card: undo that.
+                    self.run(Cmd::Info);
+                    if !self.is_fullscreen() {
+                        self.run(Cmd::Maximize);
+                    }
                     return Some(LRESULT(0));
                 }
                 if matches!(hit, None | Some(ui::Hit::Panel | ui::Hit::Modal)) && self.start_text(x, y, true) {
@@ -2890,6 +3098,18 @@ impl App {
                 self.context_menu(x, y);
                 Some(LRESULT(0))
             }
+            // A wheel that tilts, or two fingers sideways on a touchpad.
+            WM_MOUSEHWHEEL => {
+                let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
+                let s = self.scale();
+                if let Some(doc) = self.peek.as_mut().and_then(|p| p.doc.as_mut()).filter(|d| d.can_scroll_sideways()) {
+                    doc.scroll_by(0.0, delta as f32 / 120.0 * 64.0 * s);
+                    self.ui.show(true);
+                    self.arm_idle();
+                    self.invalidate();
+                }
+                Some(LRESULT(0))
+            }
             WM_MOUSEWHEEL => {
                 let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
                 let ctrl = (wp.0 & 0x0008) != 0;
@@ -2922,8 +3142,12 @@ impl App {
                 // Held Z shows the image at 100% about the cursor; letting go puts it back.
                 let repeat = (lp.0 >> 30) & 1 == 1;
                 let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
-                if ctrl && !repeat && self.dialog.is_none() {
-                    // Ctrl+Z puts back the last file deleted.
+                if ctrl && self.trim.is_some() && self.dialog.is_none() {
+                    // Trimming, Ctrl+Z undoes the last change, and Ctrl+Shift+Z does it again.
+                    let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                    self.run(if shift { Cmd::Redo } else { Cmd::Undo });
+                } else if ctrl && !repeat && self.dialog.is_none() {
+                    // Ctrl+Z puts back the last file deleted, or the photo as it was saved over.
                     self.run(Cmd::Undo);
                 } else if !repeat {
                     self.hold_z(true);
@@ -2952,6 +3176,18 @@ impl App {
                     TIMER_ANIMATION => self.tick_animation(),
                     TIMER_SAVE => self.save_settings(),
                     TIMER_OCR => self.start_ocr(),
+                    TIMER_SPEED => self.apply_speed(),
+                    TIMER_SPEEDS => self.show_speeds(false),
+                    TIMER_UPDATE => {
+                        unsafe {
+                            let _ = KillTimer(Some(self.hwnd), TIMER_UPDATE);
+                        }
+                        self.update.start(self.hwnd, self.settings.check_updates);
+                    }
+                    TIMER_FRAME => unsafe {
+                        let _ = KillTimer(Some(self.hwnd), TIMER_FRAME);
+                        self.invalidate();
+                    },
                     TIMER_LOADING => unsafe {
                         let _ = KillTimer(Some(self.hwnd), TIMER_LOADING);
                         if let Some(s) = &mut self.shown {
@@ -2998,6 +3234,12 @@ impl App {
                 self.take_saved();
                 Some(LRESULT(0))
             }
+            crate::update::WM_UPDATE => {
+                if let Some(line) = self.update.on_message(wp.0) {
+                    self.say_for(&line, Duration::from_secs(4));
+                }
+                Some(LRESULT(0))
+            }
             WM_DROPFILES => {
                 self.on_drop(HDROP(wp.0 as *mut _));
                 Some(LRESULT(0))
@@ -3032,6 +3274,16 @@ impl App {
                 None
             }
             WM_DESTROY => {
+                // Saves can't be undone once the window's gone: the copies kept for that go.
+                for u in &self.undo {
+                    if let Undo::Save { before, .. } = u {
+                        let _ = std::fs::remove_file(before);
+                    }
+                }
+                // A new version that's downloaded goes in as View closes.
+                if self.peek.is_none() && self.settings.check_updates {
+                    self.update.install_on_close(self.hwnd);
+                }
                 unsafe { PostQuitMessage(0) };
                 Some(LRESULT(0))
             }
@@ -3653,6 +3905,8 @@ pub struct Start {
     pub peek: Option<HWND>,
     /// Where a video starts, in seconds.
     pub at: Option<f64>,
+    /// Started by an update, as its new version.
+    pub updated: bool,
 }
 
 /// The size and place for a new window: where it was last time if that's still on a screen,
@@ -3790,7 +4044,11 @@ pub fn create(start: Start) -> Option<HWND> {
         ocr_running: false,
         dead_key: None,
         speed: 1.0,
-        deleted: Vec::new(),
+        speed_set_at: Instant::now() - Duration::from_secs(10),
+        update: crate::update::Updater::new(),
+        screen_switch: None,
+        undo: Vec::new(),
+        trim: None,
         undo_until: None,
         thumbs: crate::thumbs::Thumbs::new(),
         grid: None,
@@ -3801,6 +4059,7 @@ pub fn create(start: Start) -> Option<HWND> {
     });
     APP.0.store(Box::into_raw(boxed), Ordering::Release);
     let app = app()?;
+    trace("text ready");
     // Windows sized the frame before View was listening; ask again, now without a title bar.
     unsafe {
         let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
@@ -3854,6 +4113,13 @@ pub fn create(start: Start) -> Option<HWND> {
     }
     app.ui.show(true);
     app.arm_idle();
+    if start.updated {
+        app.say_for(&format!("View is updated to {}", crate::update::CURRENT), Duration::from_secs(4));
+    }
+    // Well after the window and its photo are up, so looking costs the start nothing.
+    unsafe {
+        SetTimer(Some(hwnd), TIMER_UPDATE, 3000, None);
+    }
     Some(hwnd)
 }
 
