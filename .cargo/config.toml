@@ -1,0 +1,7 @@
+# Build Microsoft's C runtime into the exe. Without this, view.exe needs VCRUNTIME140.dll, which a
+# fresh Windows doesn't have: it only arrives with the Visual C++ redistributable or another app.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

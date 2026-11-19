@@ -135,9 +135,7 @@ pub fn png_bitmap(data: &[u8]) -> Result<Bitmap> {
     let color = d.color_type();
     let mut buf = vec![0u8; d.total_bytes() as usize];
     d.read_image(&mut buf).map_err(err)?;
-    let mut data = to_rgba8(buf, color, w, h)?;
-    rgba_to_pbgra(&mut data);
-    Ok(Bitmap { width: w, height: h, data })
+    Ok(Bitmap { width: w, height: h, data: to_pbgra(buf, color, w, h)? })
 }
 
 fn err(e: image::ImageError) -> String {
@@ -196,9 +194,7 @@ fn still(d: impl ImageDecoder, limits: Limits, cancel: &AtomicBool) -> Result<Pi
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
-    let mut rgba = to_rgba8(buf, color, w, h)?;
-    rgba_to_pbgra(&mut rgba);
-    let mut bitmap = Bitmap { width: w, height: h, data: rgba };
+    let mut bitmap = Bitmap { width: w, height: h, data: to_pbgra(buf, color, w, h)? };
     let has_alpha = color.has_alpha() && bitmap.has_alpha();
     let (tw, th) = fit_within(w, h, limits.max_width, limits.max_height, limits.max_pixels);
     if (tw, th) != (w, h) {
@@ -215,6 +211,17 @@ fn still(d: impl ImageDecoder, limits: Limits, cancel: &AtomicBool) -> Result<Pi
         icc: None,
         streams: false,
     })
+}
+
+/// Decoded pixels in whatever layout the file had, as premultiplied BGRA. The common layouts,
+/// RGB and RGBA at 8 bits, each take one pass over the pixels.
+fn to_pbgra(buf: Vec<u8>, color: ColorType, w: u32, h: u32) -> Result<Vec<u8>> {
+    if color == ColorType::Rgb8 {
+        return Ok(crate::picture::rgb_to_bgra(&buf));
+    }
+    let mut rgba = to_rgba8(buf, color, w, h)?;
+    rgba_to_pbgra(&mut rgba);
+    Ok(rgba)
 }
 
 fn to_rgba8(buf: Vec<u8>, color: ColorType, w: u32, h: u32) -> Result<Vec<u8>> {

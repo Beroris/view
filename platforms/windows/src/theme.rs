@@ -123,6 +123,15 @@ fn system_accent(dark: bool) -> Option<Rgb> {
     Some(Rgb(bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2]))
 }
 
+impl Palette {
+    /// Secondary text that sits on glass over a photo: half-way from `dim` to `text`, since
+    /// plain `dim` gets lost when the photo behind is dark or busy.
+    pub fn soft(&self) -> Rgb {
+        let mid = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
+        Rgb(mid(self.dim.0, self.text.0), mid(self.dim.1, self.text.1), mid(self.dim.2, self.text.2))
+    }
+}
+
 impl Rgb {
     pub fn d2d(self, a: f32) -> windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
         crate::gfx::color(self.0, self.1, self.2, a)

@@ -19,6 +19,7 @@ use windows_numerics::{Matrix3x2, Vector2};
 /// Make the Direct3D device. Loading the driver is the slow part of starting, so this runs on
 /// its own thread while the window is made and the first image decodes.
 pub fn create_d3d() -> Option<ID3D11Device> {
+    crate::util::trace("device: starting");
     let make = |kind: D3D_DRIVER_TYPE, flags: D3D11_CREATE_DEVICE_FLAG| {
         let mut device = None;
         unsafe { D3D11CreateDevice(None, kind, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut device), None, None) }
@@ -31,6 +32,7 @@ pub fn create_d3d() -> Option<ID3D11Device> {
         .or_else(|| make(D3D_DRIVER_TYPE_HARDWARE, D3D11_CREATE_DEVICE_BGRA_SUPPORT))
         .or_else(|| make(D3D_DRIVER_TYPE_WARP, video))
         .or_else(|| make(D3D_DRIVER_TYPE_WARP, D3D11_CREATE_DEVICE_BGRA_SUPPORT))?;
+    crate::util::trace("device: made");
     // Media Foundation's decoding threads share the device with drawing.
     if let Ok(mt) = unsafe { device.GetImmediateContext() }.and_then(|c| c.cast::<ID3D11Multithread>()) {
         unsafe {
@@ -81,6 +83,10 @@ pub struct Gpu {
     max_bitmap: u32,
     /// The image layer, drawn here first when glass panels need something to blur.
     scene: Option<ID2D1Bitmap1>,
+    /// Whether this frame (or, before `begin`, the last one) was drawn into `scene`.
+    scene_used: std::cell::Cell<bool>,
+    /// A copy of a scene, kept to fade away over the next screen.
+    kept: Option<ID2D1Bitmap1>,
     /// Scene → clamp the edges → blur, made once, and the blur's current strength.
     blur: Option<(ID2D1Effect, ID2D1Effect, f32)>,
 }
@@ -122,7 +128,7 @@ impl Gpu {
             let _ = dxgi_factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
             let brush = dc.CreateSolidColorBrush(&color(255, 255, 255, 1.0), None)?;
             let max_bitmap = dc.GetMaximumBitmapSize().max(2048);
-            let mut gpu = Gpu { dc, swap, target: None, brush, checker: None, width: width.max(1), height: height.max(1), max_bitmap, scene: None, blur: None };
+            let mut gpu = Gpu { dc, swap, target: None, brush, checker: None, width: width.max(1), height: height.max(1), max_bitmap, scene: None, scene_used: std::cell::Cell::new(false), kept: None, blur: None };
             gpu.attach()?;
             Ok(gpu)
         }
@@ -151,6 +157,8 @@ impl Gpu {
             return Ok(());
         }
         self.scene = None;
+        self.kept = None;
+        self.scene_used.set(false);
         if let Some((border, _, _)) = &self.blur {
             unsafe { border.SetInput(0, None::<&ID2D1Image>, true) };
         }
@@ -165,6 +173,7 @@ impl Gpu {
     }
 
     pub fn begin(&self) {
+        self.scene_used.set(false);
         unsafe {
             self.dc.BeginDraw();
             self.dc.SetTransform(&Matrix3x2::identity());
@@ -172,10 +181,15 @@ impl Gpu {
     }
 
     /// Finish drawing and show it. An error means the device was lost and must be remade.
-    pub fn end(&self) -> windows::core::Result<()> {
+    /// False when nothing was shown because the window is covered or off screen: then showing
+    /// doesn't wait for the display, and the caller has to pace itself.
+    pub fn end(&self) -> windows::core::Result<bool> {
+        const DXGI_STATUS_OCCLUDED: i32 = 0x087A0001;
         unsafe {
             self.dc.EndDraw(None, None)?;
-            self.swap.Present(1, DXGI_PRESENT(0)).ok()
+            let shown = self.swap.Present(1, DXGI_PRESENT(0));
+            shown.ok()?;
+            Ok(shown.0 != DXGI_STATUS_OCCLUDED)
         }
     }
 
@@ -197,7 +211,52 @@ impl Gpu {
         }
         let Some(scene) = &self.scene else { return false };
         unsafe { self.dc.SetTarget(scene) };
+        self.scene_used.set(true);
         true
+    }
+
+    /// Keep a copy of the last frame's scene, for `draw_kept`. False if the last frame didn't
+    /// draw one.
+    pub fn keep_scene(&mut self) -> bool {
+        let Some(scene) = self.scene.as_ref().filter(|_| self.scene_used.get()) else {
+            self.kept = None;
+            return false;
+        };
+        if self.kept.is_none() {
+            let props = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                colorContext: std::mem::ManuallyDrop::new(None),
+            };
+            self.kept = unsafe { self.dc.CreateBitmap(D2D_SIZE_U { width: self.width, height: self.height }, None, 0, &props) }.ok();
+        }
+        let Some(kept) = &self.kept else { return false };
+        if unsafe { kept.CopyFromBitmap(None, scene, None) }.is_err() {
+            self.kept = None;
+            return false;
+        }
+        true
+    }
+
+    /// The kept scene, at `opacity`, grown or shrunk about the middle by `scale`. False if
+    /// there's none.
+    pub fn draw_kept(&self, opacity: f32, scale: f32) -> bool {
+        let Some(kept) = &self.kept else { return false };
+        let (w, h) = (self.width as f32, self.height as f32);
+        let (dw, dh) = (w * scale, h * scale);
+        let dest = rect((w - dw) / 2.0, (h - dh) / 2.0, dw, dh);
+        unsafe {
+            let rt: &ID2D1RenderTarget = &self.dc;
+            rt.DrawBitmap(kept, Some(&dest), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+        }
+        true
+    }
+
+    /// Done with the kept scene.
+    pub fn drop_kept(&mut self) {
+        self.kept = None;
     }
 
     /// Back to the window, with the scene drawn into it.

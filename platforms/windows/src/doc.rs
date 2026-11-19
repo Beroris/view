@@ -67,6 +67,8 @@ pub enum Source {
 struct Loaded {
     source: Result<Source, String>,
     note: Option<String>,
+    /// The file as its plain text, when `source` shows it laid out (Markdown, a web page).
+    text: Option<Source>,
 }
 
 enum State {
@@ -119,6 +121,10 @@ pub struct Doc {
     pub hover: Option<(f32, f32)>,
     /// Where the document's box starts in the window.
     origin: (f32, f32),
+    /// The view that isn't showing, of a file with two: laid out, and as text.
+    other: Option<Source>,
+    /// The text is showing, not the laid-out view.
+    as_text: bool,
 }
 
 /// The most matches kept, and the most of a PDF's characters held in memory for finding.
@@ -177,7 +183,31 @@ impl Doc {
             }
             _ => State::Failed("View can't show this file.".into()),
         };
-        Doc { path: path.to_path_buf(), state, note: None, scroll: 0.0, scroll_x: 0.0, target: (0.0, 0.0), stepped: Instant::now(), followed: Instant::now(), selection: None, view: (0.0, 0.0), laid: None, resume: None, finding: None, textures: HashMap::new(), open: HashSet::new(), rows: Vec::new(), hover: None, origin: (0.0, 0.0) }
+        Doc { path: path.to_path_buf(), state, note: None, scroll: 0.0, scroll_x: 0.0, target: (0.0, 0.0), stepped: Instant::now(), followed: Instant::now(), selection: None, view: (0.0, 0.0), laid: None, resume: None, finding: None, textures: HashMap::new(), open: HashSet::new(), rows: Vec::new(), hover: None, origin: (0.0, 0.0), other: None, as_text: false }
+    }
+
+    /// For a file with two views, whether its text is the one showing. `None` for a file
+    /// with only one.
+    pub fn shows_text(&self) -> Option<bool> {
+        (self.other.is_some() && matches!(self.state, State::Text(_))).then_some(self.as_text)
+    }
+
+    /// Show the file as its text, or laid out to read.
+    pub fn show_text(&mut self, text: bool) {
+        if self.shows_text() != Some(!text) {
+            return;
+        }
+        let (State::Text(showing), Some(other)) = (&mut self.state, &mut self.other) else { return };
+        std::mem::swap(showing, other);
+        self.as_text = text;
+        // A different layout altogether: start at its top, with nothing selected.
+        self.laid = None;
+        self.resume = None;
+        self.selection = None;
+        (self.scroll, self.scroll_x, self.target) = (0.0, 0.0, (0.0, 0.0));
+        if let Some(f) = &mut self.finding {
+            f.stale = true;
+        }
     }
 
     /// Take what the loading threads have finished. True if the document changed shape (it
@@ -187,6 +217,8 @@ impl Doc {
             State::Loading(rx) => match rx.try_recv() {
                 Ok(l) => {
                     self.note = l.note;
+                    self.other = l.text;
+                    self.as_text = false;
                     self.state = match l.source {
                         Ok(s) => State::Text(s),
                         Err(e) => State::Failed(e),
@@ -374,6 +406,22 @@ impl Doc {
         }
         let (my, mx) = ((laid.height - self.view.1).max(0.0), (laid.wide - self.view.0).max(0.0));
         self.target = ((self.target.0 + dy).clamp(0.0, my), (self.target.1 + dx).clamp(0.0, mx));
+    }
+
+    /// Move at once by this much, down and across: for dragging a table about by hand.
+    pub fn drag_by(&mut self, dy: f32, dx: f32) {
+        self.scroll_by(dy, dx);
+        (self.scroll, self.scroll_x) = self.target;
+    }
+
+    /// Dragging moves it: a table with more to see, since its text isn't there to select.
+    pub fn draggable(&self) -> bool {
+        !self.selectable() && self.laid.as_ref().is_some_and(|l| l.grid.is_some() && (l.wide > self.view.0 + 1.0 || l.height > self.view.1 + 1.0))
+    }
+
+    /// All of its height is on screen, so the wheel has nothing to do but go sideways.
+    pub fn fits_height(&self) -> bool {
+        self.laid.as_ref().is_some_and(|l| l.height <= self.view.1 + 1.0)
     }
 
     /// Scroll at once, without gliding: for following a drag.
@@ -1025,6 +1073,14 @@ impl Doc {
             let bar = rect(r.right - 7.0 * s, y, 3.0 * s, thumb);
             gpu.fill_round(bar, 1.5 * s, p.text.d2d(0.35 * alpha));
         }
+        // And one along the bottom, when there's more to the side.
+        if laid.wide > w + 1.0 && alpha > 0.01 {
+            let track = w - 24.0 * s;
+            let thumb = (track * w / laid.wide).max(28.0 * s);
+            let x = r.left + 12.0 * s + (track - thumb) * (sx / (laid.wide - w)).clamp(0.0, 1.0);
+            let bar = rect(x, r.bottom - 7.0 * s, thumb, 3.0 * s);
+            gpu.fill_round(bar, 1.5 * s, p.text.d2d(0.35 * alpha));
+        }
     }
 
     fn lay_out(&self, gpu: &Gpu, text: &Text, p: &Palette, w: f32, s: f32) -> Option<Laid> {
@@ -1127,7 +1183,7 @@ impl Doc {
 
 fn load_text(path: &Path, kind: TextKind) -> Loaded {
     use std::io::Read;
-    let fail = |e: String| Loaded { source: Err(e), note: None };
+    let fail = |e: String| Loaded { source: Err(e), note: None, text: None };
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => return fail(format!("View couldn't read this file: {e}")),
@@ -1145,8 +1201,29 @@ fn load_text(path: &Path, kind: TextKind) -> Loaded {
         cut_lines |= more;
         t
     };
+    // Markdown and web pages have two views: laid out to read, and the text they're written in.
+    let extension = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let page = matches!(extension.as_str(), "html" | "htm" | "xhtml") && matches!(kind, TextKind::Code(_));
+    let mut as_text = None;
     let source = match kind {
-        TextKind::Markdown => Source::Markdown(markdown::parse(&text)),
+        TextKind::Markdown => {
+            let blocks = markdown::parse(&text);
+            let t = lines(text);
+            as_text = Some(Source::Code { spans: Vec::new(), text: t, numbers: true });
+            Source::Markdown(blocks)
+        }
+        TextKind::Code(lang) if page => {
+            let blocks = view_core::html::to_blocks(&text);
+            let t = lines(text);
+            let code = Source::Code { spans: textfile::highlight(&t, lang), text: t, numbers: true };
+            // A page with nothing to read (all script, say) is shown as what it is.
+            if blocks.is_empty() {
+                code
+            } else {
+                as_text = Some(code);
+                Source::Markdown(blocks)
+            }
+        }
         TextKind::Json => {
             let t = lines(textfile::pretty_json(&text).unwrap_or(text));
             Source::Code { spans: textfile::highlight_json(&t), text: t, numbers: true }
@@ -1177,12 +1254,12 @@ fn load_text(path: &Path, kind: TextKind) -> Loaded {
     } else {
         None
     };
-    Loaded { source: Ok(source), note }
+    Loaded { source: Ok(source), note, text: as_text }
 }
 
 /// A Word, Excel or PowerPoint file, or a zip, read for the preview.
 fn load_document(path: &Path, kind: DocKind) -> Loaded {
-    let fail = |e: String| Loaded { source: Err(e), note: None };
+    let fail = |e: String| Loaded { source: Err(e), note: None, text: None };
     if std::fs::metadata(path).is_ok_and(|m| m.len() > 1 << 30) {
         return fail("This file is too big to preview.".into());
     }
@@ -1193,14 +1270,14 @@ fn load_document(path: &Path, kind: DocKind) -> Loaded {
     match kind {
         DocKind::Word => match view_core::office::docx(&data) {
             Ok(b) if b.is_empty() => fail("This document is empty.".into()),
-            Ok(b) => Loaded { source: Ok(Source::Markdown(b)), note: None },
+            Ok(b) => Loaded { source: Ok(Source::Markdown(b)), note: None, text: None },
             Err(e) => fail(e),
         },
         DocKind::Slides => match view_core::slides::read(&data) {
             Ok(mut deck) => {
                 let raw = std::mem::take(&mut deck.pictures);
                 let pictures = decode_pictures(&raw);
-                Loaded { source: Ok(Source::Slides { deck, pictures }), note: None }
+                Loaded { source: Ok(Source::Slides { deck, pictures }), note: None, text: None }
             }
             Err(e) => fail(e),
         },
@@ -1218,13 +1295,13 @@ fn load_document(path: &Path, kind: DocKind) -> Loaded {
                     let s = notes.join(", ");
                     if book.sheets.len() > 1 { s } else { format!("Showing {s}") }
                 });
-                Loaded { source: Ok(Source::Table(book.rows)), note }
+                Loaded { source: Ok(Source::Table(book.rows)), note, text: None }
             }
             Err(e) => fail(e),
         },
         DocKind::Archive => match view_core::zip::tree(&data, 50_000) {
             Some(t) if t.nodes.is_empty() => fail("This zip is empty.".into()),
-            Some(t) => Loaded { source: Ok(Source::Archive(t)), note: None },
+            Some(t) => Loaded { source: Ok(Source::Archive(t)), note: None, text: None },
             None => fail("This zip is damaged, or isn't really a zip.".into()),
         },
     }

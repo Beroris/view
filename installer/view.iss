@@ -246,6 +246,8 @@ Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExe}\SupportedTypes"; Va
 ; Space preview, if it's on (from this install or from View's menu): start it again now, since
 ; installing closed it.
 Filename: "{app}\{#AppExe}"; Parameters: "--space-preview"; Flags: nowait runasoriginaluser; Check: SpacePreviewOn
+; An update asked for from View's menu: open View again, on the file it was showing.
+Filename: "{app}\{#AppExe}"; Parameters: "{code:ReopenArgs}"; Flags: nowait; Check: Reopening
 Filename: "{app}\{#AppExe}"; Description: "Start {#AppName} now"; Flags: postinstall nowait skipifsilent unchecked
 Filename: "ms-settings:defaultapps?registeredAppUser={#AppName}"; Description: "Choose {#AppName} as the default for images"; Flags: postinstall shellexec nowait skipifsilent unchecked
 
@@ -276,6 +278,22 @@ end;
 function SpacePreviewOn(): Boolean;
 begin
   Result := RegValueExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'View Space preview');
+end;
+
+{ View's own updater passes /REOPEN=1, and /REOPENFILE= with the file that was open. }
+function Reopening(): Boolean;
+begin
+  Result := ExpandConstant('{param:REOPEN|0}') = '1';
+end;
+
+function ReopenArgs(Param: String): String;
+var
+  OpenFile: String;
+begin
+  Result := '--updated';
+  OpenFile := ExpandConstant('{param:REOPENFILE|}');
+  if OpenFile <> '' then
+    Result := Result + ' "' + OpenFile + '"';
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;

@@ -133,6 +133,7 @@ pub(super) fn draw_grid(app: &mut App, gpu: &mut Gpu) {
     }
     // The name and the buttons go over the thumbnails, so they're in the picture the glass blurs.
     shades(gpu, &p, cw, ch, s, 0.7, true, false);
+    screen_switch(app, gpu, cw, ch);
     if scene {
         gpu.end_scene();
     }
@@ -196,6 +197,20 @@ pub(super) fn filmstrip(app: &mut App, gpu: &mut Gpu, aw: f32, ah: f32, alpha: f
         return;
     }
     let s = app.scale();
+    // It keeps out of the photo's way until the mouse comes down towards it, and stays while
+    // the mouse is on it. The toolbar alone is what a still mouse elsewhere shows.
+    let near = app.ui.mouse_inside && app.mouse.1 as f32 > ah - 190.0 * s;
+    let on_it = matches!(app.ui.hover, Some(Hit::Thumb(_) | Hit::Strip)) || matches!(app.ui.pressed, Some(Hit::Thumb(_)));
+    // The speeds rise out of the toolbar where the strip is: it steps aside while they're out.
+    app.ui.slide_strip((near || on_it) && !app.ui.speeds_out());
+    let open = app.ui.strip_open();
+    if open < 0.01 {
+        // Out of sight, it has nowhere to glide to.
+        app.strip_at = app.folder.index as f32;
+        return;
+    }
+    let alpha = alpha * open;
+    let rise = ((1.0 - open) * 10.0 * s).round();
     let p = app.palette;
     let n = app.folder.len();
     let index = app.folder.index;
@@ -213,9 +228,12 @@ pub(super) fn filmstrip(app: &mut App, gpu: &mut Gpu, aw: f32, ah: f32, alpha: f
     let total = n as f32 * step - gap;
     let inner = total.min((aw - cx.px(40.0)).min(cx.px(760.0)) - pad * 2.0).max(cell);
     let (w, h) = (inner + pad * 2.0, cell + pad * 2.0);
-    let r = rect(((aw - w) / 2.0).round(), bar_top - cx.px(10.0) - h, w, h);
+    let r = rect(((aw - w) / 2.0).round(), bar_top - cx.px(10.0) - h + rise, w, h);
     glass_box(gpu, &p, r, cx.px(14.0), s, alpha);
-    app.ui.targets.push((r, Hit::Strip));
+    let cx = Ctx { text: &app.text, s };
+    if app.ui.strip_open() > 0.5 {
+        app.ui.targets.push((r, Hit::Strip));
+    }
 
     let off = if total <= inner { 0.0 } else { (at * step + cell / 2.0 - inner / 2.0).clamp(0.0, total - inner) };
     let x0 = r.left + pad - off;
@@ -232,13 +250,17 @@ pub(super) fn filmstrip(app: &mut App, gpu: &mut Gpu, aw: f32, ah: f32, alpha: f
         let cr = rect((x0 + i as f32 * step).round(), r.top + pad, cell, cell);
         let hit = Hit::Thumb(i as u32);
         let current = i == index;
-        let a = alpha * if current || app.ui.hover == Some(hit) { 1.0 } else { 0.55 };
+        let a = alpha * if current || app.ui.hover == Some(hit) { 1.0 } else { 0.72 };
         let path = &app.folder.entries[i].path;
         match app.thumbs.get(path) {
             Some(t) => gpu.draw_texture_cover(t, cr, radius, a),
             None => gpu.fill_round(cr, radius, p.text.d2d(0.08 * alpha)),
         }
         media_badge(&cx, gpu, cr, path, a);
+        if !current {
+            // A hairline, so a dark thumbnail still has an edge against a dark photo.
+            gpu.stroke_round(cr, radius, 1.0, p.text.d2d(0.22 * alpha));
+        }
         if current {
             // A ring just outside the picture, so it doesn't cover any of it.
             let o = cx.px(2.5);
@@ -246,7 +268,7 @@ pub(super) fn filmstrip(app: &mut App, gpu: &mut Gpu, aw: f32, ah: f32, alpha: f
             gpu.stroke_round(ring, radius + o, cx.px(2.0).max(1.0), p.accent.d2d(alpha));
         }
         let seen = rect(cr.left.max(view.left), cr.top, (cr.right.min(view.right) - cr.left.max(view.left)).max(0.0), cell);
-        if seen.right > seen.left {
+        if seen.right > seen.left && app.ui.strip_open() > 0.5 {
             app.ui.targets.push((seen, hit));
         }
     }
@@ -344,7 +366,7 @@ pub(super) fn draw_editor(app: &mut App, gpu: &mut Gpu) {
         y += slider(app, gpu, i, &values[i as usize], x, y, width);
     }
 
-    // Reset and Cancel, and Save under them, at the bottom of the card.
+    // Reset and Cancel, and the saves under them, at the bottom of the card.
     let cx = Ctx { text: &app.text, s };
     let save_h = cx.px(36.0);
     let save = rect(x, panel.bottom - pad - save_h, width, save_h);
@@ -358,11 +380,21 @@ pub(super) fn draw_editor(app: &mut App, gpu: &mut Gpu) {
             app.ui.targets.push((r, Hit::Button(cmd)));
         }
     }
-    let hit = Hit::Button(Cmd::EditSave);
+    // Saving over the original is the main one, where the photo can be written back as it was;
+    // a copy beside it, plainer, next to it. Otherwise a copy is all there is.
+    let (main, main_text) = if app.can_save_over() {
+        let copy = rect(x, save.top, half, save_h);
+        plain_button(&cx, gpu, &app.ui, &p, copy, "Save a copy", Hit::Button(Cmd::EditSaveCopy));
+        app.ui.targets.push((copy, Hit::Button(Cmd::EditSaveCopy)));
+        (rect(x + half + cx.px(8.0), save.top, width - half - cx.px(8.0), save_h), (Cmd::EditSave, "Save"))
+    } else {
+        (save, (Cmd::EditSaveCopy, "Save a copy"))
+    };
+    let hit = Hit::Button(main_text.0);
     let a = if saving { 0.55 } else if app.ui.pressed == Some(hit) { 0.8 } else if app.ui.hover == Some(hit) { 0.9 } else { 1.0 };
-    gpu.fill_round(save, save_h / 2.0, p.accent.d2d(a));
-    label(&cx, gpu, if saving { "Saving…" } else { "Save a copy" }, save, 13.0, 600, Align::Center, p.accent.ink(), 1.0);
-    app.ui.targets.push((save, hit));
+    gpu.fill_round(main, save_h / 2.0, p.accent.d2d(a));
+    label(&cx, gpu, if saving { "Saving…" } else { main_text.1 }, main, 13.0, 600, Align::Center, p.accent.ink(), 1.0);
+    app.ui.targets.push((main, hit));
 
     let mid = s * TITLE / 2.0;
     title(app, gpu, panel.left, mid, 1.0);
@@ -549,4 +581,218 @@ pub(super) fn card_pictures_height(cx: &Ctx, n: usize, cw: f32) -> f32 {
     let cell = ((cw - cx.px(56.0) - gap * 2.0) / 3.0).min(cx.px(110.0)).floor();
     let rows = n.min(6).div_ceil(3) as f32;
     rows * cell + (rows - 1.0) * gap
+}
+
+// ---- Trimming a video ----
+
+/// The controls for trimming, in a card along the bottom. On top, play and the bar: the parts
+/// left end to end (a deleted part closes up), the picture along it and the sound in a thinner
+/// lane under, what's kept between two handles, and the splits. Under it, the tools and the
+/// times; at the bottom, the buttons.
+pub fn trim_bar(app: &mut App, gpu: &mut Gpu, aw: f32, ch: f32) {
+    let s = app.scale();
+    let p = app.palette;
+    let Some(t) = app.trim.as_ref() else { return };
+    let (start, end, mute, sound, progress, selected) = (t.start, t.end, t.mute, t.sound, t.progress(), t.selected);
+    let has_splits = !t.splits.is_empty();
+    // The parts left: which, where they are in the video, and what's become of their sound.
+    let parts: Vec<(usize, f64, f64, crate::trim::Part)> = (0..t.parts.len()).filter(|&i| !t.parts[i].deleted).map(|i| (i, t.bounds(i).0, t.bounds(i).1, t.parts[i])).collect();
+    // The splits that can be moved, between two parts left; and where parts were deleted.
+    let movable: Vec<(usize, f64)> = (0..t.splits.len()).filter(|&i| t.split_shown(i)).map(|i| (i, t.splits[i])).collect();
+    let line_length = t.length();
+    let shown = t.shown();
+    let line = move |x: f64| {
+        let mut along = 0.0;
+        for &(a, b) in &shown {
+            if x < a {
+                return along;
+            }
+            if x <= b {
+                return along + (x - a);
+            }
+            along += b - a;
+        }
+        along
+    };
+    let kept = t.kept();
+    let saving = progress.is_some();
+    let (pos, paused) = app.player().map_or((0.0, true), |pl| (pl.position(), pl.paused() || pl.ended));
+    let cx = Ctx { text: &app.text, s };
+    let width = (aw - cx.px(32.0)).min(cx.px(920.0)).max(cx.px(300.0));
+    let pad = cx.px(14.0);
+    let bar_h = cx.px(46.0);
+    let bh = cx.px(32.0);
+    let height = pad * 2.0 + bar_h + cx.px(12.0) + bh + cx.px(8.0) + bh;
+    let card = rect(((aw - width) / 2.0).round(), ch - cx.px(16.0) - height, width, height);
+    glass_box(gpu, &p, card, cx.px(22.0), s, 1.0);
+    app.ui.targets.push((card, Hit::Toolbar));
+    let cx = Ctx { text: &app.text, s };
+    let live = |targets: &mut Vec<(D2D_RECT_F, Hit)>, r: D2D_RECT_F, hit: Hit| {
+        if !saving {
+            targets.push((r, hit));
+        }
+    };
+
+    // Play, and the bar.
+    let button = cx.px(36.0);
+    let row = card.top + pad;
+    let play = rect(card.left + pad, row + (bar_h - button) / 2.0, button, button);
+    let hit = Hit::Button(Cmd::PlayPause);
+    hover_fill(gpu, &app.ui, &p, play, hit, button / 2.0, 1.0, false);
+    icon(&cx, gpu, if paused { '\u{E768}' } else { '\u{E769}' }, play, 15.0, p.text, 1.0, false);
+    live(&mut app.ui.targets, play, hit);
+    let tab = cx.px(12.0);
+    let strip = rect(play.right + cx.px(10.0), row, card.right - pad - play.right - cx.px(10.0), bar_h);
+    // The handles sit outside what's kept, so the track runs between their inner edges.
+    let track = rect(strip.left + tab, strip.top, strip.right - strip.left - tab * 2.0, bar_h);
+    let tw = track.right - track.left;
+    let at = |t: f64| (track.left + tw * (line(t) / line_length).clamp(0.0, 1.0) as f32).round();
+    let lane_gap = cx.px(4.0);
+    let sound_h = cx.px(13.0);
+    let picture = rect(track.left, track.top, tw, bar_h - sound_h - lane_gap);
+    let sound_lane = rect(track.left, track.bottom - sound_h, tw, sound_h);
+    gpu.fill_round(strip, cx.px(8.0), p.text.d2d(0.07));
+    let edge = cx.px(2.0);
+    // Each part left: lit where it's kept, its sound lit unless silenced.
+    for &(i, a, b, part) in &parts {
+        let (xa, xb) = (at(a.max(start)), at(b.min(end)));
+        if xb <= xa {
+            continue;
+        }
+        let w = xb - xa;
+        gpu.fill(rect(xa, picture.top, w, picture.bottom - picture.top), p.accent.d2d(if selected == Some(i) { 0.30 } else { 0.16 }));
+        gpu.fill(rect(xa, track.top, w, edge), p.accent.d2d(1.0));
+        gpu.fill(rect(xa, track.bottom - edge, w, edge), p.accent.d2d(1.0));
+        if sound && !mute && !part.silent {
+            gpu.fill(rect(xa, sound_lane.top, w, sound_h - edge), p.accent.d2d(0.42));
+        } else if sound && !mute && w > cx.px(18.0) {
+            icon(&cx, gpu, '\u{E74F}', rect(xa, sound_lane.top, w, sound_h - edge), 9.0, p.dim, 1.0, false);
+        }
+    }
+    // Where parts were deleted, the two either side meet at a notch.
+    for pair in parts.windows(2) {
+        if (pair[0].2 - pair[1].1).abs() > 1e-9 {
+            let x = at(pair[1].1);
+            gpu.fill(rect(x - cx.px(1.0), strip.top, cx.px(2.0), bar_h), p.panel.d2d(1.0));
+            let k = cx.px(4.0);
+            gpu.fill_circle(x, strip.top - k / 2.0, k, p.panel.d2d(1.0));
+            gpu.fill_circle(x, strip.bottom + k / 2.0, k, p.panel.d2d(1.0));
+        }
+    }
+    // The part picked, outlined.
+    if let Some(&(_, a, b, _)) = parts.iter().find(|x| Some(x.0) == selected) {
+        let (xa, xb) = (at(a), at(b));
+        gpu.stroke_round(rect(xa + 1.0, track.top + 1.0, (xb - xa - 2.0).max(1.0), bar_h - 2.0), cx.px(3.0), cx.px(2.0), p.text.d2d(0.95));
+    }
+    app.ui.seek_track = Some(track);
+    live(&mut app.ui.targets, strip, Hit::Trim(2));
+
+    // The splits: a line each, to drag.
+    let reach = cx.px(5.0);
+    for &(i, t) in &movable {
+        let x = at(t);
+        let mark = rect(x - cx.px(1.5), strip.top - cx.px(3.0), cx.px(3.0), bar_h + cx.px(6.0));
+        let hit = Hit::Trim(3 + i as u8);
+        let lit = app.ui.hover == Some(hit) || app.ui.pressed == Some(hit);
+        gpu.fill_round(mark, cx.px(1.5), p.text.d2d(if lit { 1.0 } else { 0.85 }));
+        gpu.fill_circle(x, strip.bottom + cx.px(3.0), cx.px(if lit { 4.5 } else { 3.5 }), p.text.d2d(1.0));
+        live(&mut app.ui.targets, rect(x - reach, strip.top - reach, reach * 2.0, bar_h + reach * 2.0), hit);
+    }
+    for (i, x) in [(0u8, at(start) - tab), (1u8, at(end))] {
+        let handle = rect(x, track.top, tab, bar_h);
+        let hit = Hit::Trim(i);
+        let a = if app.ui.pressed == Some(hit) { 0.8 } else if app.ui.hover == Some(hit) { 0.9 } else { 1.0 };
+        gpu.fill_round(handle, cx.px(5.0), p.accent.d2d(a));
+        // Square on the inside, where it meets what's kept.
+        let inner = if i == 0 { rect(x + tab / 2.0, track.top, tab / 2.0, bar_h) } else { rect(x, track.top, tab / 2.0, bar_h) };
+        gpu.fill(inner, p.accent.d2d(a));
+        let grip = rect((x + tab / 2.0 - 1.0).round(), track.top + bar_h * 0.32, 2.0, bar_h * 0.36);
+        gpu.fill_round(grip, 1.0, p.accent.ink().d2d(0.8));
+        live(&mut app.ui.targets, rect(x - reach, strip.top - reach, tab + reach * 2.0, bar_h + reach * 2.0), hit);
+    }
+    // Where it's playing.
+    let xp = at(pos);
+    gpu.fill(rect(xp - 1.0, strip.top - cx.px(4.0), 2.0, bar_h + cx.px(8.0)), p.text.d2d(0.95));
+    gpu.fill_circle(xp, strip.top - cx.px(4.0), cx.px(4.0), p.text.d2d(0.95));
+
+    let bw = |t: &str| (measure(&cx, t, 13.0, 600) + cx.px(32.0)).round();
+    let gap = cx.px(8.0);
+
+    // The tools: split; with a part picked, delete it or silence it; else take all the sound
+    // out. The times on the right.
+    let row2 = row + bar_h + cx.px(12.0);
+    // Where it's playing in the video as it'll be saved, and how long that is.
+    let times = format!("{} / {}", crate::trim::clock((line(pos) - line(start)).clamp(0.0, kept)), crate::trim::clock(kept));
+    let length = String::new();
+    let (tw1, tw2) = (measure(&cx, &times, 13.0, 600), measure(&cx, &length, 12.0, 500));
+    let right_edge = card.right - pad - cx.px(4.0);
+    label(&cx, gpu, &length, rect(right_edge - tw2 - cx.px(2.0), row2, tw2 + cx.px(2.0), bh), 12.0, 500, Align::Left, p.dim, 1.0);
+    let times_left = right_edge - tw2 - cx.px(10.0) - tw1;
+    label(&cx, gpu, &times, rect(times_left - cx.px(2.0), row2, tw1 + cx.px(4.0), bh), 13.0, 600, Align::Left, p.text, 1.0);
+    let picked = parts.iter().find(|x| Some(x.0) == selected).map(|x| x.3);
+    let mut tools: Vec<(&str, Cmd, bool)> = vec![("Split", Cmd::TrimSplit, false)];
+    match picked {
+        Some(part) => {
+            tools.push(("Delete", Cmd::TrimDelete, false));
+            if sound && !mute {
+                tools.push((if part.silent { "Sound back" } else { "Remove its sound" }, Cmd::TrimPartSound, part.silent));
+            }
+        }
+        None if sound => tools.push((if mute { "Sound removed" } else { "Remove all sound" }, Cmd::TrimSound, mute)),
+        None => {}
+    }
+    let mut x = card.left + pad;
+    for (text, cmd, on) in tools {
+        let w = bw(text);
+        if x + w > times_left - gap {
+            break;
+        }
+        let r = rect(x, row2, w, bh);
+        plain_button(&cx, gpu, &app.ui, &p, r, text, Hit::Button(cmd));
+        if on {
+            gpu.stroke_round(r, bh / 2.0, 1.5, p.accent.d2d(1.0));
+        }
+        live(&mut app.ui.targets, r, Hit::Button(cmd));
+        x = r.right + gap;
+    }
+
+    // The buttons: Reset on the left; Save, Save a copy and Cancel on the right.
+    let row3 = row2 + bh + cx.px(8.0);
+    let over = app.can_save_over();
+    let main = if over { (Cmd::EditSave, "Save") } else { (Cmd::EditSaveCopy, "Save a copy") };
+    let main_text = match progress {
+        Some(f) => format!("Saving\u{2026} {}%", (f * 100.0).floor() as u32),
+        None => main.1.to_string(),
+    };
+    let w = bw(&main_text).max(bw("Saving\u{2026} 100%"));
+    let mr = rect(card.right - pad - w, row3, w, bh);
+    let hit = Hit::Button(main.0);
+    let a = if saving { 0.55 } else if app.ui.pressed == Some(hit) { 0.8 } else if app.ui.hover == Some(hit) { 0.9 } else { 1.0 };
+    gpu.fill_round(mr, bh / 2.0, p.accent.d2d(a));
+    label(&cx, gpu, &main_text, mr, 13.0, 600, Align::Center, p.accent.ink(), 1.0);
+    live(&mut app.ui.targets, mr, hit);
+    let mut x = mr.left - gap;
+    let mut plain = Vec::new();
+    if over {
+        plain.push(("Save a copy", Cmd::EditSaveCopy));
+    }
+    plain.push(("Cancel", Cmd::EditCancel));
+    for (text, cmd) in plain {
+        let w = bw(text);
+        let r = rect(x - w, row3, w, bh);
+        plain_button(&cx, gpu, &app.ui, &p, r, text, Hit::Button(cmd));
+        live(&mut app.ui.targets, r, Hit::Button(cmd));
+        x = r.left - gap;
+    }
+    let reset = rect(card.left + pad, row3, bw("Reset"), bh);
+    if reset.right < x {
+        plain_button(&cx, gpu, &app.ui, &p, reset, "Reset", Hit::Button(Cmd::EditReset));
+        live(&mut app.ui.targets, reset, Hit::Button(Cmd::EditReset));
+        // What the keys do, where there's room.
+        let hint = if has_splits { "S splits \u{00B7} click a part to pick it \u{00B7} Del deletes it \u{00B7} Ctrl+Z undoes" } else { "S splits where it's playing \u{00B7} Ctrl+Z undoes" };
+        let hw = measure(&cx, hint, 12.0, 400);
+        if reset.right + cx.px(14.0) + hw < x {
+            label(&cx, gpu, hint, rect(reset.right + cx.px(14.0), row3, hw + cx.px(2.0), bh), 12.0, 400, Align::Left, p.dim, 1.0);
+        }
+    }
 }

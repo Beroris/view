@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=View
+GenericName=Image Viewer
+Comment=Look at photos
+Exec=bero-view %f
+Icon=bero-view
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/tiff;image/vnd.microsoft.icon;
+StartupWMClass=bero-view

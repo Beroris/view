@@ -74,6 +74,21 @@ pub fn available_memory() -> u64 {
     if unsafe { GlobalMemoryStatusEx(&mut m) }.is_ok() { m.ullAvailPhys } else { 1 << 30 }
 }
 
+/// The main display's refresh rate, in frames a second. 60 if Windows won't say.
+pub fn refresh_rate() -> f64 {
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+    let mut mode = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+    let ok = unsafe { EnumDisplaySettingsW(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut mode) }.as_bool();
+    if ok && mode.dmDisplayFrequency > 1 { mode.dmDisplayFrequency as f64 } else { 60.0 }
+}
+
+/// Whether timings are being logged, for callers whose message costs something to put together.
+pub fn tracing() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VIEW_TRACE").is_some())
+}
+
 /// Logs timings to `%TEMP%\view-trace.txt` when `VIEW_TRACE` is set. Off otherwise, and free.
 pub fn trace(what: &str) {
     use std::sync::OnceLock;

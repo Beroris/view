@@ -21,6 +21,7 @@
 //! - [`zip`] and [`office`]: what's in a zip, and the words in Word, Excel and PowerPoint files.
 //! - [`slides`]: PowerPoint slides laid out as they look, for drawing.
 //! - [`edit`]: crop, straighten and colour changes to a photo, for saving as a copy.
+//! - [`update`]: reading GitHub's answer about the latest release, and checking a download.
 
 pub mod cache;
 pub mod decode;
@@ -28,6 +29,7 @@ pub mod folder;
 pub mod field;
 pub mod find;
 pub mod formats;
+pub mod html;
 pub mod icc;
 pub mod kind;
 pub mod markdown;
@@ -42,6 +44,7 @@ pub mod resume;
 pub mod settings;
 pub mod textfile;
 pub mod tween;
+pub mod update;
 pub mod viewport;
 mod xml;
 pub mod zip;

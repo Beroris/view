@@ -55,6 +55,8 @@ pub struct Player {
     pub error: Option<String>,
     /// Where the last frame step went, and when: steps quicker than the seeks count on from it.
     stepped: Option<(f64, std::time::Instant)>,
+    /// When the last new frame arrived, for timing gaps in a trace.
+    frame_at: Option<std::time::Instant>,
 }
 
 impl Player {
@@ -86,7 +88,7 @@ impl Player {
             let _ = engine.SetMuted(muted);
             engine.SetAutoPlay(autoplay)?;
             engine.SetSource(&BSTR::from(path.to_string_lossy().as_ref()))?;
-            Ok(Player { engine, ex, device: device.clone(), _manager: manager, serial, path: path.to_path_buf(), frame: None, last_pts: -1, has_frame: false, ready: false, ended: false, error: None, stepped: None })
+            Ok(Player { engine, ex, device: device.clone(), _manager: manager, serial, path: path.to_path_buf(), frame: None, last_pts: -1, has_frame: false, ready: false, ended: false, error: None, stepped: None, frame_at: None })
         }
     }
 
@@ -202,6 +204,7 @@ impl Player {
 
     /// Play at `rate` times normal speed: 1 is normal. Kept through seeks and replays.
     pub fn set_rate(&mut self, rate: f64) {
+        crate::util::trace(&format!("video: speed {rate}"));
         unsafe {
             let _ = self.engine.SetDefaultPlaybackRate(rate);
             let _ = self.engine.SetPlaybackRate(rate);
@@ -229,6 +232,13 @@ impl Player {
                 let dst = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
                 let black = MFARGB { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbAlpha: 255 };
                 if unsafe { self.engine.TransferVideoFrame(texture, None, &dst, Some(&black)) }.is_ok() {
+                    if crate::util::tracing() {
+                        // A gap between frames long enough to see, as when the speed changes.
+                        let gap = self.frame_at.replace(std::time::Instant::now()).map_or(0.0, |at| at.elapsed().as_secs_f64() * 1000.0);
+                        if gap > 70.0 {
+                            crate::util::trace(&format!("video: {gap:.0} ms with no new frame"));
+                        }
+                    }
                     self.last_pts = pts;
                     self.has_frame = true;
                 }

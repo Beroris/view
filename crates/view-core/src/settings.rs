@@ -121,6 +121,8 @@ pub struct Settings {
     pub filmstrip: bool,
     /// How big the grid's thumbnails are, in DIPs.
     pub grid_size: u32,
+    /// Look for a new version once a day, and install it when View closes.
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -150,6 +152,7 @@ impl Default for Settings {
             peek_mode: PeekMode::Popup,
             filmstrip: true,
             grid_size: 170,
+            check_updates: true,
         }
     }
 }

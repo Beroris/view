@@ -116,6 +116,11 @@ impl Pool {
         if self.shared.running.lock().unwrap().iter().any(|r| r.path == job.path && r.task == job.task && !r.cancel.load(Ordering::Relaxed)) {
             return;
         }
+        // Finished and waiting to be picked up: the first photo is decoded while the window is
+        // still being made, and asking again then would decode it a second time.
+        if self.shared.done.lock().unwrap().iter().any(|d| d.path == job.path && d.task == job.task) {
+            return;
+        }
         q.push_back(job);
         drop(q);
         self.shared.wake.notify_one();
